@@ -164,6 +164,61 @@ async def expand_and_retrieve(query: str, session_id: str) -> List[Dict]:
     )
 
 
+CHART_TOOLS = {"generate_chart", "generate_dashboard"}
+
+
+def capture_charts(raw: str, sink: List[Dict]) -> str:
+    """
+    Divert chart payloads into the response and return a compact receipt.
+
+    Plotly figures run to kilobytes. Feeding them back as tool results would burn
+    the context window and force the model to copy them verbatim into its answer,
+    which it does unreliably. The figures travel out-of-band instead.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return str(raw)[:500]
+
+    if not payload.get("success"):
+        return json.dumps({"success": False, "error": payload.get("error")})
+
+    # generate_dashboard returns a list; generate_chart is the single-figure case
+    charts = payload.get("charts") or [payload]
+    receipts = []
+
+    for chart in charts:
+        layout = (chart.get("chart_json") or {}).get("layout") or {}
+        title = (
+            chart.get("title")
+            or (layout.get("title") or {}).get("text")
+            or f"Chart {len(sink) + 1}"
+        )
+
+        sink.append(
+            {
+                "type": "chart",
+                "chart_data": {
+                    "chart_json": chart.get("chart_json"),
+                    "summary": chart.get("summary"),
+                },
+                "caption": title,
+            }
+        )
+        receipts.append({"title": title, "summary": chart.get("summary")})
+
+    logger.info(f"  🎨 Captured {len(receipts)} chart(s) out-of-band")
+
+    return json.dumps(
+        {
+            "success": True,
+            "rendered": receipts,
+            "failures": payload.get("failures", []),
+            "note": "These charts are already attached to the response. Describe them in 'answer' and leave 'visualizations' empty.",
+        }
+    )
+
+
 def extract_tool_info(tc: Any) -> tuple[str, Dict]:
     """
     Safely extract tool name and arguments from various formats.
@@ -440,6 +495,7 @@ async def chat(req: ChatRequest):
         ctx = ""
         srcs = []
         agent_trace = []
+        produced_charts = []
 
         # Agentic reasoning loop
         while turn < settings.AGENT_MAX_TURNS:
@@ -535,6 +591,8 @@ async def chat(req: ChatRequest):
                     if isinstance(result, Exception):
                         formatted_result = f"Error: {str(result)}"
                         logger.error(f"  ❌ Parallel error in {info['name']}: {result}")
+                    elif info["name"] in CHART_TOOLS:
+                        formatted_result = capture_charts(result, produced_charts)
                     elif info["name"] == "search_knowledge_base" and isinstance(
                         result, list
                     ):
@@ -586,6 +644,17 @@ async def chat(req: ChatRequest):
                 break
 
         logger.info(f"🏁 Agent loop completed: {turn} turns")
+
+        # Charts actually rendered by tools win over anything the model echoed back;
+        # tables and prose blocks it composed are kept alongside them
+        if produced_charts:
+            composed = [
+                v
+                for v in final_meta.get("visualizations", [])
+                if v.get("type") != "chart"
+            ]
+            final_meta["visualizations"] = produced_charts + composed
+            logger.info(f"🎨 Attached {len(produced_charts)} chart(s) to response")
 
         # Save to history
         await session_store.add_chat_turn(sid, req.query, final_text or "No response.")

@@ -70,12 +70,18 @@ class Settings(BaseSettings):
 
     # Single source of truth for /models and /models/select; "gemini:" prefix routes to Google
     SUPPORTED_MODELS: list = [
+        "gemini:gemini-2.5-flash",
+        "gemini:gemini-flash-latest",
+        "gemini:gemini-3-flash-preview",
         "gpt-5.2",
         "gpt-5-mini",
         "gpt-4o",
-        "gemini:gemini-flash-latest",
-        "gemini:gemini-3-flash-preview",
     ]
+
+    # Transient faults (429 rate limit, 503 overload) are retried before failing over.
+    # Kept low on purpose: a funding error is never retried, and each attempt costs.
+    LLM_MAX_RETRIES: int = 2
+    LLM_RETRY_BASE_DELAY: float = 1.0
 
     # =========================
     # RAG Configuration

@@ -225,7 +225,7 @@ def get_status():
 # ============================================================
 
 
-def render_chart(chart_data):
+def render_chart(chart_data, slot=""):
     """
     Render Plotly chart with responsive sizing.
     Supports both old format (chart_json) and new format (full chart_data)
@@ -240,9 +240,12 @@ def render_chart(chart_data):
         # Create figure from JSON
         fig = go.Figure(chart_json)
 
-        # Render with responsive width
+        # Slot disambiguates identical figures in one dashboard, which would
+        # otherwise collide on a content-derived key
         st.plotly_chart(
-            fig, use_container_width=True, key=f"chart_{hash(str(chart_json))}"
+            fig,
+            use_container_width=True,
+            key=f"chart_{slot}_{hash(str(chart_json))}",
         )
 
     except Exception as e:
@@ -250,12 +253,12 @@ def render_chart(chart_data):
         st.code(json.dumps(chart_data, indent=2))
 
 
-def render_visualization(viz):
+def render_visualization(viz, slot=""):
     """Render a single visualization (chart or table)"""
 
     if viz.get("type") == "chart":
         if viz.get("chart_data"):
-            render_chart(viz["chart_data"])
+            render_chart(viz["chart_data"], slot)
 
         if viz.get("caption"):
             st.caption(viz["caption"])
@@ -291,14 +294,14 @@ def render_message(msg):
         if msg.get("visualizations"):
             st.divider()
             for i, viz in enumerate(msg["visualizations"]):
-                render_visualization(viz)
+                render_visualization(viz, f"hist{i}")
                 if i < len(msg["visualizations"]) - 1:
                     st.markdown("")  # Spacing
 
         # Legacy chart support
         elif msg.get("chart"):
             st.divider()
-            render_chart(msg["chart"])
+            render_chart(msg["chart"], "legacy")
 
         # Sources
         if msg.get("sources"):
@@ -597,13 +600,13 @@ if prompt := st.chat_input("Ask about your data..."):
         vizs = meta.get("visualizations", [])
         if vizs:
             st.divider()
-            for viz in vizs:
-                render_visualization(viz)
+            for i, viz in enumerate(vizs):
+                render_visualization(viz, f"live{i}")
 
         # Legacy chart support
         elif meta.get("chart"):
             st.divider()
-            render_chart(meta["chart"])
+            render_chart(meta["chart"], "livelegacy")
 
         # Display sources
         all_sources = list(

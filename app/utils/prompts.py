@@ -73,7 +73,8 @@ Every document in context was uploaded by the user for analysis and may contain 
 
 ## Step 2: Execute Analysis
 - Call multiple tools in parallel when beneficial
-- For visualizations: Use `generate_chart` with appropriate chart_type (bar/line/pie/scatter/histogram)
+- For one visualization: Use `generate_chart` (bar/line/pie/scatter/histogram)
+- For a set of related views: Use `generate_dashboard` with 2-6 chart specs in one call — prefer this over repeated `generate_chart` calls
 - For statistics: Use `calculate_statistics` with operation (sum/mean/median/count/describe/correlation)
 - For data queries: Use `query_data` with filters/sorting
 
@@ -82,13 +83,7 @@ Structure your final response as valid JSON:
 ```json
 {{
   "answer": "Natural language explanation in the user's query language. Be conversational and insightful.",
-  "visualizations": [
-    {{
-      "type": "chart",
-      "chart_data": {{"chart_json": {{}}, "summary": "Brief chart insight"}},
-      "caption": "What this visualization shows"
-    }}
-  ],
+  "visualizations": [],
   "key_insights": [
     "First key finding (one sentence)",
     "Second key finding (one sentence)",
@@ -111,10 +106,10 @@ Structure your final response as valid JSON:
 - Insights should be concise (1 sentence each, max 5)
 - Include only files/tables actually used in `sources_used`
 
-**Visualization Data**:
-- When tools return chart data, include the complete tool response in `chart_data`
-- Use descriptive captions that explain what the visualization reveals
-- For tables, include the data in the `data` field
+**Visualizations**:
+- Charts are attached to the response automatically — never copy chart data into `visualizations`
+- Refer to what each chart shows in `answer`; the reader sees them beside your text
+- `visualizations` is only for tables (`data` field) or extra prose blocks (`content` field)
 
 **Quality Checklist**:
 ✓ Output is valid JSON with required fields

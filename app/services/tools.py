@@ -104,6 +104,29 @@ def _parse_custom_data(custom_data: Any) -> List[Dict]:
     return custom_data
 
 
+def _resolve_dataframe(args: Dict, dfs: Dict) -> tuple:
+    """Resolve a tool's data source to (dataframe, error); exactly one of the two is None."""
+    custom_data = args.get("custom_data")
+    table_name = args.get("table_name")
+
+    if custom_data:
+        try:
+            df = pd.DataFrame(_parse_custom_data(custom_data))
+        except Exception as e:
+            return None, f"Invalid custom_data: {e}"
+        if df.empty:
+            return None, "custom_data produced an empty table"
+        return df.loc[:, ~df.columns.duplicated()], None
+
+    if table_name and table_name != "__none__":
+        df = dfs.get(table_name)
+        if df is None or df.empty:
+            return None, f"Table '{table_name}' not found. Available: {list(dfs.keys())}"
+        return df.loc[:, ~df.columns.duplicated()], None
+
+    return None, "Must provide either 'table_name' or 'custom_data'"
+
+
 def get_tool_definitions(dataframes: Dict[str, pd.DataFrame]) -> List[Dict]:
     """
     Generate tool definitions with clear guidance on data sources.
@@ -184,6 +207,72 @@ Create Plotly charts from tabular data.
                         },
                     },
                     "required": ["chart_type", "x_column", "title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_dashboard",
+                "description": f"""
+Create several related charts from one dataset in a single call.
+
+Use when a question is better answered by a set of views than by one chart — for
+example a trend over time alongside a breakdown by category and a distribution.
+Prefer this over calling generate_chart repeatedly.
+
+{data_guidance}
+""",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {
+                            "type": "string",
+                            "description": "Name of the table to visualize (use ONLY if table exists)",
+                            "enum": table_names if table_names else ["__none__"],
+                        },
+                        "custom_data": {
+                            "type": "array",
+                            "description": "Custom data as list of dicts (use for extracted PDF data)",
+                            "items": {"type": "object"},
+                        },
+                        "charts": {
+                            "type": "array",
+                            "description": "Two to six chart specifications, all drawn from the same dataset",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "chart_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "bar",
+                                            "line",
+                                            "pie",
+                                            "scatter",
+                                            "histogram",
+                                        ],
+                                    },
+                                    "x_column": {"type": "string"},
+                                    "y_column": {"type": "string"},
+                                    "aggregation": {
+                                        "type": "string",
+                                        "enum": [
+                                            "sum",
+                                            "mean",
+                                            "count",
+                                            "min",
+                                            "max",
+                                            "none",
+                                        ],
+                                    },
+                                    "title": {"type": "string"},
+                                    "color_column": {"type": "string"},
+                                },
+                                "required": ["chart_type", "x_column", "title"],
+                            },
+                        },
+                    },
+                    "required": ["charts"],
                 },
             },
         },
@@ -344,6 +433,8 @@ async def execute_tool(
     try:
         if name == "generate_chart":
             result = await _generate_chart(args, dfs)
+        elif name == "generate_dashboard":
+            result = await _generate_dashboard(args, dfs)
         elif name == "calculate_statistics":
             result = await _calculate_statistics(args, dfs)
         elif name == "query_data":
@@ -378,45 +469,18 @@ async def _generate_chart(args: Dict, dfs: Dict) -> str:
     logger.info(f"  📦 Custom data: {len(custom_data) if custom_data else 0} records")
     logger.info(f"  📏 Columns: X={x_col}, Y={y_col}")
 
-    df = None
+    df, error = _resolve_dataframe(args, dfs)
+    if error:
+        logger.error(f"  ❌ {error}")
+        return json.dumps({"success": False, "error": error})
 
-    # Source 1: Custom data (from PDFs, etc.)
+    # Values lifted out of prose arrive as strings; coerce the plotted axes
     if custom_data:
-        try:
-            # Parse JSON strings if present
-            parsed_data = _parse_custom_data(custom_data)
-            df = pd.DataFrame(parsed_data)
-            logger.info(f"  ✅ Loaded custom data: {df.shape}")
+        for col in (x_col, y_col):
+            if col and col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="ignore")
 
-            # Convert numeric columns
-            for col in [x_col, y_col]:
-                if col and col in df.columns:
-                    try:
-                        df[col] = pd.to_numeric(df[col])
-                        logger.info(f"    📊 Converted {col} to numeric")
-                    except (ValueError, TypeError):
-                        logger.info(f"    📝 Kept {col} as-is (non-numeric)")
-
-        except Exception as e:
-            error_msg = f"Invalid custom_data: {e}"
-            logger.error(f"  ❌ {error_msg}")
-            return json.dumps({"success": False, "error": error_msg})
-
-    # Source 2: Table (from structured files)
-    elif table_name and table_name != "__none__":
-        df = dfs.get(table_name)
-
-        if df is None or df.empty:
-            error_msg = f"Table '{table_name}' not found. Available: {list(dfs.keys())}"
-            logger.error(f"  ❌ {error_msg}")
-            return json.dumps({"success": False, "error": error_msg})
-
-        logger.info(f"  ✅ Loaded table '{table_name}': {df.shape}")
-
-    else:
-        error_msg = "Must provide either 'table_name' or 'custom_data'"
-        logger.error(f"  ❌ {error_msg}")
-        return json.dumps({"success": False, "error": error_msg})
+    logger.info(f"  ✅ Data resolved: {df.shape}")
 
     # Generate chart
     result = ChartService.generate_chart(
@@ -432,6 +496,28 @@ async def _generate_chart(args: Dict, dfs: Dict) -> str:
     # Convert numpy types for JSON serialization
     if result.get("success") and result.get("chart_json"):
         result["chart_json"] = _convert_numpy_types(result["chart_json"])
+
+    return json.dumps(result)
+
+
+async def _generate_dashboard(args: Dict, dfs: Dict) -> str:
+    """Build a set of related charts from one dataset."""
+    charts_spec = args.get("charts") or []
+
+    logger.info(f"  📊 Dashboard: {len(charts_spec)} charts requested")
+
+    if not charts_spec:
+        return json.dumps({"success": False, "error": "No chart specifications given"})
+
+    df, error = _resolve_dataframe(args, dfs)
+    if error:
+        logger.error(f"  ❌ {error}")
+        return json.dumps({"success": False, "error": error})
+
+    result = ChartService.generate_multiple_charts(df, charts_spec)
+
+    for chart in result.get("charts", []):
+        chart["chart_json"] = _convert_numpy_types(chart["chart_json"])
 
     return json.dumps(result)
 

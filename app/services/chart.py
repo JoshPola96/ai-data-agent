@@ -356,59 +356,53 @@ class ChartService:
             logger.error(f"❌ Chart generation failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
+    MAX_DASHBOARD_CHARTS = 6
+
     @staticmethod
     def generate_multiple_charts(
         df: pd.DataFrame,
         chart_configs: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
-        Generate multiple charts from a single dataset.
+        Generate several charts from one dataset.
 
-        Args:
-            df: DataFrame
-            chart_configs: List of chart configurations
-                [
-                    {"chart_type": "bar", "x_column": "...", ...},
-                    {"chart_type": "line", "x_column": "...", ...},
-                ]
+        One bad specification must not lose the others, so each is attempted
+        independently and both outcomes are reported:
 
-        Returns:
-            {
-                "success": bool,
-                "charts": [
-                    {"chart_json": {...}, "chart_html": "...", "summary": "..."},
-                    ...
-                ],
-                "error": str,
-            }
+            {"success": bool, "charts": [...], "failures": [{"title", "error"}]}
+
+        `success` is False only when nothing could be built.
         """
-        try:
-            logger.info(f"📊 Generating {len(chart_configs)} charts...")
+        requested = chart_configs[: ChartService.MAX_DASHBOARD_CHARTS]
+        logger.info(f"📊 Dashboard: building {len(requested)} charts")
 
-            charts = []
-            for i, config in enumerate(chart_configs, 1):
-                logger.info(f"  📊 Chart {i}/{len(chart_configs)}")
+        charts, failures = [], []
 
+        for i, config in enumerate(requested, 1):
+            title = config.get("title") or f"Chart {i}"
+
+            try:
                 result = ChartService.generate_chart(df, **config)
+            except TypeError as e:
+                result = {"success": False, "error": f"Unsupported option: {e}"}
 
-                if result["success"]:
-                    charts.append(
-                        {
-                            "chart_json": result["chart_json"],
-                            "chart_html": result["chart_html"],
-                            "summary": result["summary"],
-                        }
-                    )
-                else:
-                    logger.warning(f"  ⚠️  Chart {i} failed: {result['error']}")
+            if result.get("success"):
+                charts.append(
+                    {
+                        "title": title,
+                        "chart_json": result["chart_json"],
+                        "chart_html": result["chart_html"],
+                        "summary": result["summary"],
+                    }
+                )
+            else:
+                logger.warning(f"  ⚠️ '{title}' failed: {result.get('error')}")
+                failures.append({"title": title, "error": result.get("error")})
 
-            logger.info(f"  ✅ Generated {len(charts)}/{len(chart_configs)} charts")
+        logger.info(f"  ✅ {len(charts)} built, {len(failures)} failed")
 
-            return {
-                "success": True,
-                "charts": charts,
-            }
-
-        except Exception as e:
-            logger.error(f"❌ Multiple chart generation failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+        return {
+            "success": bool(charts),
+            "charts": charts,
+            "failures": failures,
+        }

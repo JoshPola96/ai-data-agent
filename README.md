@@ -95,11 +95,26 @@ Sessions expire after `SESSION_TTL` (1h default), refreshed on access. `DELETE /
 | `search_knowledge_base` | Retrieve passages from indexed documents |
 | `calculate_statistics` | sum, mean, median, std, min, max, count, describe, correlation — with optional `group_by` |
 | `query_data` | Filter, sort and page through table rows |
-| `generate_chart` | Plotly bar / line / pie / scatter / histogram |
+| `generate_chart` | One Plotly figure — bar / line / pie / scatter / histogram |
+| `generate_dashboard` | Up to six related figures from one dataset in a single call |
 
 Tools run **concurrently** — a question needing a lookup and two calculations issues all three at once rather than serially.
 
 Structured data (spreadsheets, PDF tables) is addressed by `table_name`. Figures the model extracts from prose are passed inline as `custom_data`, which lets it chart numbers that were never in a table.
+
+### Charts travel out-of-band
+
+A Plotly figure runs to tens of kilobytes. Returning one as a tool result would put it in the context window on every subsequent turn, and asking the model to copy it into its answer is both expensive and unreliable.
+
+Instead, figures are intercepted when the tool returns: they attach directly to the response, and the model receives a short receipt — titles and summary statistics only. Measured on a four-chart dashboard, the model sees **673 bytes instead of 75,643** — a 99% reduction, repeated on every turn thereafter.
+
+A malformed chart specification is isolated: the remaining charts still render, and the failure is reported alongside them rather than discarding the batch.
+
+### Failure handling
+
+Transient provider faults — HTTP 429 rate limits, 503 overload, timeouts — are retried with exponential backoff and jitter before failing over to the other provider.
+
+Funding failures are deliberately excluded. An exhausted account also returns 429, but no amount of retrying will clear it, so it fails straight through instead of burning billable calls.
 
 ---
 
@@ -107,10 +122,12 @@ Structured data (spreadsheets, PDF tables) is addressed by `table_name`. Figures
 
 Final answers conform to a Pydantic schema — `answer`, `visualizations`, `key_insights`, `sources_used` — so the frontend renders them without parsing prose.
 
-The two providers reach this differently, because Gemini rejects a response schema and tool declarations in the same request:
+The two providers reach this differently, and the differences are instructive:
 
-- **OpenAI** — tools and schema travel together; the model either calls a tool or emits schema-valid JSON.
-- **Gemini** — tools first; once it stops calling tools, a second schema-constrained pass shapes the answer.
+- **OpenAI** — tool declarations and a `json_schema` response format travel in one request; the model either calls a tool or returns JSON matching the schema. Sent through `create()` rather than the `parse()` helper, because `parse()` requires every tool to be `strict`, and the free-form `custom_data` argument cannot be expressed in OpenAI's strict subset.
+- **Gemini** — rejects a response schema alongside tool declarations, so tools run first and a second pass shapes the answer. That pass uses JSON mode rather than a schema: the Developer API also rejects `additionalProperties`, which Pydantic emits for this schema's `Dict[str, Any]` fields. The shape is specified in the system prompt instead.
+
+Both paths converge on the same parser, which falls back through direct JSON, fenced code blocks, and field salvage — so a malformed answer degrades rather than crashes.
 
 ---
 
@@ -119,8 +136,9 @@ The two providers reach this differently, because Gemini rejects a response sche
 Everything lives in `.env`; see [`.env.example`](.env.example) for the full set.
 
 ```bash
-DEFAULT_MODEL=gpt-5.2                     # "gemini:" prefix routes to Google
+DEFAULT_MODEL=gemini:gemini-2.5-flash     # "gemini:" prefix routes to Google
 FALLBACK_MODEL=gemini:gemini-flash-latest # one failover hop, then a clean error
+LLM_MAX_RETRIES=2                         # transient faults retried before failover
 
 EMBEDDING_MODEL=BAAI/bge-m3               # 1024-dim, 100+ languages
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
@@ -203,6 +221,8 @@ app/
 - The FAISS index is in-memory and rebuilt on document removal; it does not survive a restart. Uploaded documents are re-ingested from `app/kb/` only.
 - BM25 is rebuilt per request rather than maintained incrementally — fine at this corpus size, the first thing to change as it grows.
 - No authentication. Sessions are client-supplied UUIDs, which isolate data but do not authenticate it. Put this behind auth before exposing it.
+- Schema enforcement is stronger on OpenAI than on Gemini, for the API reasons above. Gemini relies on JSON mode plus a prompt-specified shape and a tolerant parser.
+- `matplotlib` is declared in `requirements.txt` but unused — charts are Plotly only. Safe to drop on the next rebuild.
 
 ## License
 

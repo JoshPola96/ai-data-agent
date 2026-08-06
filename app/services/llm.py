@@ -8,6 +8,7 @@ Separated tool calling from structured output enforcement
 import json
 import logging
 import asyncio
+import random
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from google import genai
@@ -20,7 +21,53 @@ from app.utils.schemas import FinalResponseSchema
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Non-strict json_schema: strict mode would require fully-specified object schemas,
+# A funding failure looks like a rate limit (both are 429) but never clears on retry,
+# so it is matched first and allowed to fail straight through to the other provider.
+_FUNDING_MARKERS = ("insufficient_quota", "no credits", "billing", "credit_balance")
+_TRANSIENT_MARKERS = (
+    "resource_exhausted",
+    "unavailable",
+    "overloaded",
+    "high demand",
+    "timeout",
+    "temporarily",
+    "try again",
+)
+_TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True when retrying the same provider has a realistic chance of succeeding."""
+    text = str(exc).lower()
+
+    if any(m in text for m in _FUNDING_MARKERS):
+        return False
+
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(status, int) and status in _TRANSIENT_STATUS:
+        return True
+
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+async def _with_retry(call, label: str):
+    """Retry transient provider faults with exponential backoff and jitter."""
+    for attempt in range(1, settings.LLM_MAX_RETRIES + 1):
+        try:
+            return await call()
+        except Exception as e:
+            if attempt >= settings.LLM_MAX_RETRIES or not _is_transient(e):
+                raise
+            wait = settings.LLM_RETRY_BASE_DELAY * 2 ** (attempt - 1) + random.uniform(
+                0, 0.3
+            )
+            logger.warning(
+                f"⚠️ {label} transient fault ({type(e).__name__}), retry {attempt}/{settings.LLM_MAX_RETRIES - 1} in {wait:.1f}s"
+            )
+            await asyncio.sleep(wait)
+
+
+# Non-strict json_schema: strict mode requires fully-specified object schemas,
 # which the free-form `custom_data` tool argument cannot satisfy.
 RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -219,7 +266,9 @@ class LLMService:
             kwargs["tool_choice"] = "auto"
 
         try:
-            response = await self.openai_client.chat.completions.create(**kwargs)
+            response = await _with_retry(
+                lambda: self.openai_client.chat.completions.create(**kwargs), "OpenAI"
+            )
             msg = response.choices[0].message
 
             if msg.tool_calls:
@@ -334,11 +383,12 @@ class LLMService:
             ],
         )
 
-        # Enforce schema when no tools (final answer)
+        # JSON mode only: the Developer API rejects response_schema containing
+        # additionalProperties, which Pydantic emits for this schema's Dict[str, Any]
+        # fields. The shape is specified in the system prompt and parsed tolerantly.
         if not tools:
-            logger.info("🔒 Enforcing Structured Output (Gemini)")
+            logger.info("🔒 JSON mode (Gemini final answer)")
             config.response_mime_type = "application/json"
-            config.response_schema = FinalResponseSchema
 
         try:
             clean_model = model_name.split(":")[-1] if ":" in model_name else model_name
@@ -346,11 +396,14 @@ class LLMService:
                 f"📤 Calling Gemini {clean_model} with {len(gemini_msgs)} messages"
             )
 
-            response = await asyncio.to_thread(
-                self.gemini_client.models.generate_content,
-                model=clean_model,
-                contents=gemini_msgs,
-                config=config,
+            response = await _with_retry(
+                lambda: asyncio.to_thread(
+                    self.gemini_client.models.generate_content,
+                    model=clean_model,
+                    contents=gemini_msgs,
+                    config=config,
+                ),
+                "Gemini",
             )
 
             if not response.candidates:
