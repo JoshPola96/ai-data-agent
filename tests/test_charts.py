@@ -15,6 +15,7 @@ DF = pd.DataFrame(
         "quarter": ["Q1", "Q2", "Q3", "Q4"] * 4,
         "revenue": [120, 135, 128, 171, 98, 104, 99, 142, 156, 161, 149, 203, 87, 91, 88, 119],
         "units": [340, 390, 355, 470, 290, 310, 295, 430, 410, 425, 395, 540, 260, 275, 265, 360],
+        "margin": [18.5, 19.2, 17.8, 21.4, 15.1, 15.9, 14.7, 19.8, 22.3, 22.9, 21.1, 25.6, 13.4, 13.9, 12.8, 17.2],
     }
 )
 
@@ -66,6 +67,94 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         out = json.loads(raw)
         self.assertFalse(out["success"])
         self.assertIn("sales", out["error"])
+
+
+class ColorColumnTest(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression: aggregating dropped the colour column.
+
+    groupby(x)[y].reset_index() keeps only those two columns, so plotting then failed
+    on a colour column that no longer existed — breaking every "trend over time, split
+    by category" request, which is one of the most natural things to ask for.
+    """
+
+    async def chart(self, **args):
+        raw = await execute_tool("generate_chart", {"table_name": "sales", **args}, {"sales": DF})
+        return json.loads(raw)
+
+    async def test_line_split_by_category_survives_aggregation(self):
+        out = await self.chart(
+            chart_type="line", x_column="quarter", y_column="revenue",
+            aggregation="sum", color_column="region", title="Trend by region",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+        names = [t.get("name") for t in out["chart_json"]["data"]]
+        self.assertEqual(sorted(names), ["East", "North", "South", "West"])
+
+    async def test_count_aggregation_keeps_the_colour_split(self):
+        out = await self.chart(
+            chart_type="bar", x_column="region", aggregation="count",
+            color_column="quarter", title="Counts",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(len(out["chart_json"]["data"]), 4)
+
+    async def test_colour_column_is_fuzzy_matched_like_x_and_y(self):
+        out = await self.chart(
+            chart_type="line", x_column="quarter", y_column="revenue",
+            aggregation="sum", color_column="REGION ", title="Fuzzy",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(len(out["chart_json"]["data"]), 4)
+
+    async def test_without_a_colour_column_a_single_series_is_produced(self):
+        out = await self.chart(
+            chart_type="line", x_column="quarter", y_column="revenue",
+            aggregation="sum", title="Plain",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(len(out["chart_json"]["data"]), 1)
+
+    async def test_grouped_bars_are_side_by_side_not_stacked(self):
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="revenue",
+            aggregation="sum", color_column="quarter", title="Grouped",
+        )
+        self.assertEqual(out["chart_json"]["layout"].get("barmode"), "group")
+
+
+class NewChartTypesTest(unittest.IsolatedAsyncioTestCase):
+    async def chart(self, **args):
+        raw = await execute_tool("generate_chart", {"table_name": "sales", **args}, {"sales": DF})
+        return json.loads(raw)
+
+    async def test_box_plot(self):
+        out = await self.chart(chart_type="box", x_column="region", y_column="revenue", title="Spread")
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(out["chart_json"]["data"][0]["type"], "box")
+
+    async def test_heatmap_needs_no_x_column(self):
+        out = await self.chart(chart_type="heatmap", title="Correlation")
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(out["chart_json"]["data"][0]["type"], "heatmap")
+
+    async def test_heatmap_without_numeric_columns_fails_cleanly(self):
+        raw = await execute_tool(
+            "generate_chart",
+            {"custom_data": [{"a": "x"}, {"a": "y"}], "chart_type": "heatmap", "title": "T"},
+            {},
+        )
+        out = json.loads(raw)
+        self.assertFalse(out["success"])
+        self.assertIn("numeric", out["error"])
+
+    async def test_top_n_trims_to_a_ranking(self):
+        out = await self.chart(
+            chart_type="bar", x_column="quarter", y_column="revenue",
+            aggregation="sum", top_n=2, title="Top 2",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+        self.assertEqual(len(out["chart_json"]["data"][0]["x"]), 2)
 
 
 class CaptureChartsTest(unittest.TestCase):

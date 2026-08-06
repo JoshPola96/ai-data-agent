@@ -96,6 +96,7 @@ class ChartService:
         y_col: Optional[str],
         aggregation: str,
         top_n: Optional[int] = None,
+        color_col: Optional[str] = None,
     ) -> pd.DataFrame:
         """Prepare data with cleaning, aggregation and optional top-N trimming"""
 
@@ -108,15 +109,21 @@ class ChartService:
             df[y_col] = pd.to_numeric(df[y_col], errors="coerce")
             df = df.dropna(subset=[y_col])
 
-        # Aggregation
+        # Aggregation. The colour column has to join the grouping keys, or the reset
+        # index drops it and the plot then fails on a column that no longer exists —
+        # which is every "trend by quarter, split by region" request.
         if aggregation != "none":
+            keys = [x_col]
+            if color_col and color_col in df.columns and color_col != x_col:
+                keys.append(color_col)
+
             if aggregation == "count":
-                df = df.groupby(x_col, sort=False).size().reset_index(name="count")
+                df = df.groupby(keys, sort=False).size().reset_index(name="count")
                 y_col = "count"
-                logger.info(f"  📊 Aggregated: count by {x_col}")
+                logger.info(f"  📊 Aggregated: count by {keys}")
             elif y_col:
-                df = df.groupby(x_col, sort=False)[y_col].agg(aggregation).reset_index()
-                logger.info(f"  📊 Aggregated: {aggregation}({y_col}) by {x_col}")
+                df = df.groupby(keys, sort=False)[y_col].agg(aggregation).reset_index()
+                logger.info(f"  📊 Aggregated: {aggregation}({y_col}) by {keys}")
 
         # "Top 10 products by revenue" is a ranking, not a full plot
         if top_n and y_col and y_col in df.columns:
@@ -326,6 +333,11 @@ class ChartService:
             y_col = (
                 ChartService._fuzzy_col_match(plot_df, y_column) if y_column else None
             )
+            color_col = (
+                ChartService._fuzzy_col_match(plot_df, color_column)
+                if color_column
+                else None
+            )
 
             # A correlation heatmap spans every numeric column, so it has no x-axis
             if chart_type == "heatmap":
@@ -347,7 +359,7 @@ class ChartService:
 
                 # Prepare data
                 plot_df = ChartService._prepare_data(
-                    plot_df, chart_type, x_col, y_col, aggregation, top_n
+                    plot_df, chart_type, x_col, y_col, aggregation, top_n, color_col
                 )
 
             if plot_df.empty:
@@ -365,7 +377,7 @@ class ChartService:
 
             # Create figure
             fig = ChartService._create_plotly_figure(
-                plot_df, chart_type, x_col, y_col, title, color_column
+                plot_df, chart_type, x_col, y_col, title, color_col
             )
 
             # Apply enhancements

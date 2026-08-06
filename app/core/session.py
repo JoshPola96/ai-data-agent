@@ -43,6 +43,17 @@ class SessionStore:
                 logger.error(f"❌ Redis connection failed: {e}")
                 raise
 
+    async def _touch(self, key: str, session_id: str):
+        """
+        Refresh a session key's lifetime.
+
+        The shared knowledge base is not a user session — it is the corpus everyone
+        retrieves from — so its keys never expire. Letting them lapse left vectors
+        on disk with no document registry describing them.
+        """
+        if session_id != settings.KB_SESSION_ID:
+            await self.redis_client.expire(key, SESSION_TTL)
+
     async def close(self):
         """Close Redis connection"""
         if self.redis_client:
@@ -79,7 +90,7 @@ class SessionStore:
         await self.redis_client.ltrim(key, -settings.MAX_CHAT_HISTORY, -1)
 
         # Set expiration (1 hour reset)
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
     async def get_chat_history(self, session_id: str) -> List[Dict[str, str]]:
         """
@@ -90,7 +101,7 @@ class SessionStore:
         key = self._chat_key(session_id)
 
         # Reset TTL on access (Keep-Alive)
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
         raw_history = await self.redis_client.lrange(key, 0, -1)
 
@@ -135,12 +146,12 @@ class SessionStore:
         # Store dataframe with 1h TTL
         key = self._df_key(session_id, table_name)
         await self.redis_client.set(key, df_bytes)
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
         # Track in list with 1h TTL
         list_key = self._df_list_key(session_id)
         await self.redis_client.sadd(list_key, table_name)
-        await self.redis_client.expire(list_key, SESSION_TTL)
+        await self._touch(list_key, session_id)
 
         logger.info(
             f"✅ Saved dataframe '{table_name}' ({df.shape[0]}x{df.shape[1]}) for session {session_id[:8]}"
@@ -155,7 +166,7 @@ class SessionStore:
         key = self._df_key(session_id, table_name)
 
         # Reset TTL on access (Keep-Alive)
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
         df_bytes = await self.redis_client.get(key)
 
@@ -171,7 +182,7 @@ class SessionStore:
         list_key = self._df_list_key(session_id)
 
         # Reset TTL on access
-        await self.redis_client.expire(list_key, SESSION_TTL)
+        await self._touch(list_key, session_id)
 
         table_names = await self.redis_client.smembers(list_key)
 
@@ -193,7 +204,7 @@ class SessionStore:
         await self.initialize()
 
         list_key = self._df_list_key(session_id)
-        await self.redis_client.expire(list_key, SESSION_TTL)
+        await self._touch(list_key, session_id)
 
         names = await self.redis_client.smembers(list_key)
         return [n.decode("utf-8") for n in names] if names else []
@@ -233,7 +244,7 @@ class SessionStore:
 
         # Store as hash and reset TTL to 1 hour
         await self.redis_client.hset(key, doc_id, json.dumps(doc_info))
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
         logger.info(f"📝 Registered document '{filename}' for session {session_id[:8]}")
 
@@ -244,7 +255,7 @@ class SessionStore:
         key = self._doc_index_key(session_id)
 
         # Reset TTL on access (Keep-Alive)
-        await self.redis_client.expire(key, SESSION_TTL)
+        await self._touch(key, session_id)
 
         doc_data = await self.redis_client.hgetall(key)
 

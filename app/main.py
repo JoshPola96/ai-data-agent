@@ -172,12 +172,19 @@ async def auto_ingest_kb_folder():
     # unchanged file a no-op and lets an edited one supersede its previous chunks.
     indexed = {d.get("doc_id") for d in await vector_store.get_documents()}
 
+    # Vectors alone are not enough: the document registry is what tells the agent the
+    # file exists. If either half is missing the file is re-ingested to restore both.
+    registered = {
+        d.get("doc_id")
+        for d in await session_store.get_session_documents(settings.KB_SESSION_ID)
+    }
+
     for f in files:
         try:
             content = f.read_bytes()
             doc_id = f"kb_{f.stem}_{hashlib.sha256(content).hexdigest()[:8]}"
 
-            if doc_id in indexed:
+            if doc_id in indexed and doc_id in registered:
                 logger.info(f"  ⏭ {f.name}: unchanged, already indexed")
                 continue
 
@@ -207,6 +214,14 @@ async def expand_and_retrieve(query: str, session_id: str) -> List[Dict]:
         expanded_queries=variants,
         session_ids={session_id, settings.KB_SESSION_ID},
     )
+
+
+async def _empty_dict():
+    return {}
+
+
+async def _empty_list():
+    return []
 
 
 CHART_TOOLS = {"generate_chart", "generate_dashboard"}
@@ -490,12 +505,21 @@ async def chat(req: ChatRequest):
     try:
         start_time = asyncio.get_event_loop().time()
 
-        # Load context concurrently
-        dfs, hist, docs = await asyncio.gather(
+        # Load context concurrently. The shared knowledge base is retrievable by every
+        # session, so it must appear here too — otherwise the prompt reports no files
+        # and the agent denies having any documents it can actually search.
+        kb = settings.KB_SESSION_ID
+        dfs, hist, docs, kb_dfs, kb_docs = await asyncio.gather(
             session_store.get_all_dataframes(sid),
             session_store.get_chat_history(sid),
             session_store.get_session_documents(sid),
+            session_store.get_all_dataframes(kb) if sid != kb else _empty_dict(),
+            session_store.get_session_documents(kb) if sid != kb else _empty_list(),
         )
+
+        # Session data shadows the knowledge base on a name clash
+        dfs = {**kb_dfs, **dfs}
+        docs = docs + kb_docs
 
         logger.info("📊 Context loaded:")
         logger.info(f"  DataFrames: {len(dfs)}")
