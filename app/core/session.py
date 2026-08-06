@@ -318,6 +318,16 @@ class SessionStore:
 
         logger.info(f"✨ Session {session_id[:8]} is now a clean slate.")
 
+    async def session_exists(self, session_id: str) -> bool:
+        """True while the session still holds state in Redis, i.e. has not expired."""
+        await self.initialize()
+        keys = (
+            self._doc_index_key(session_id),
+            self._chat_key(session_id),
+            self._df_list_key(session_id),
+        )
+        return any([await self.redis_client.exists(k) for k in keys])
+
     async def get_session_stats(self, session_id: str) -> Dict:
         """Get statistics for a session"""
         await self.initialize()

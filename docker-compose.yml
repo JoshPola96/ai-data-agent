@@ -32,6 +32,7 @@ services:
     volumes:
       - ./app:/app/app
       - ./app/kb:/app/kb
+      - index_data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -70,6 +71,8 @@ services:
 
 volumes:
   redis_data:
+    driver: local
+  index_data:
     driver: local
 
 networks:

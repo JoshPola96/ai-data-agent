@@ -37,6 +37,27 @@ class ClassifyTest(unittest.TestCase):
     def test_billing_wording_is_not_transient(self):
         self.assertFalse(_is_transient(Exception("credit_balance_exhausted")))
 
+    def test_gemini_rate_limit_mentioning_billing_is_still_transient(self):
+        """
+        Regression: Gemini's recoverable rate-limit text names billing.
+
+        Matching a bare "billing" marked these terminal, so they failed instantly
+        instead of backing off — the opposite of the intended behaviour.
+        """
+        real = (
+            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded "
+            "your current quota, please check your plan and billing details.'}}"
+        )
+        self.assertTrue(_is_transient(Status429(real)))
+
+    def test_openai_out_of_credit_wording_is_still_terminal(self):
+        real = (
+            "Error code: 429 - {'error': {'message': 'You have no credits remaining. "
+            "Add credits to continue using the API at https://platform.openai.com/"
+            "settings/organization/billing/.', 'type': 'insufficient_quota'}}"
+        )
+        self.assertFalse(_is_transient(Status429(real)))
+
     def test_bad_request_is_not_transient(self):
         self.assertFalse(_is_transient(Exception("400 INVALID_ARGUMENT: bad schema")))
 

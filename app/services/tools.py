@@ -11,8 +11,10 @@ from typing import Dict, List, Any
 import pandas as pd
 import numpy as np
 
+from app.core.config import get_settings
 from app.services.chart import ChartService
 
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
@@ -110,6 +112,11 @@ def _resolve_dataframe(args: Dict, dfs: Dict) -> tuple:
     table_name = args.get("table_name")
 
     if custom_data:
+        if len(custom_data) > settings.MAX_CUSTOM_DATA_ROWS:
+            return None, (
+                f"custom_data has {len(custom_data)} rows, limit is "
+                f"{settings.MAX_CUSTOM_DATA_ROWS}. Aggregate before charting."
+            )
         try:
             df = pd.DataFrame(_parse_custom_data(custom_data))
         except Exception as e:

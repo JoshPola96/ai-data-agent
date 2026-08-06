@@ -154,6 +154,19 @@ class Settings(BaseSettings):
     KB_SESSION_ID: str = "kb_default"  # shared corpus every session may retrieve from
 
     # =========================
+    # Index Persistence
+    # =========================
+    PERSIST_INDEX: bool = True
+    INDEX_DIR: str = "/app/data/index"
+
+    # =========================
+    # Request Limits
+    # =========================
+    MAX_QUERY_CHARS: int = 4000
+    MAX_SESSION_ID_CHARS: int = 64
+    MAX_CUSTOM_DATA_ROWS: int = 5000
+
+    # =========================
     # Performance
     # =========================
     MAX_CONCURRENT_TASKS: int = 10

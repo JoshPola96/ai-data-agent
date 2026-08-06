@@ -23,7 +23,14 @@ logger = logging.getLogger(__name__)
 
 # A funding failure looks like a rate limit (both are 429) but never clears on retry,
 # so it is matched first and allowed to fail straight through to the other provider.
-_FUNDING_MARKERS = ("insufficient_quota", "no credits", "billing", "credit_balance")
+# Markers must be specific: Gemini's *recoverable* rate-limit text says "check your plan
+# and billing details", so a bare "billing" here would misclassify it as terminal.
+_FUNDING_MARKERS = (
+    "insufficient_quota",
+    "no credits remaining",
+    "credit_balance",
+    "billing_not_active",
+)
 _TRANSIENT_MARKERS = (
     "resource_exhausted",
     "unavailable",

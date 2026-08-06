@@ -86,6 +86,17 @@ Uploads belong to the session that made them. Retrieval is scoped to the caller'
 
 Sessions expire after `SESSION_TTL` (1h default), refreshed on access. `DELETE /sessions/{id}` clears chat history, dataframes and vectors.
 
+### Durability
+
+The index is written to disk on every change and restored at startup, so uploads survive a restart. Writes go to a temporary file and are renamed into place, so a crash mid-write cannot leave a torn pair; on load, an index whose vector count or dimension disagrees with its document list is discarded rather than trusted.
+
+Two things follow from the index outliving the process:
+
+- **Expired sessions are pruned on startup.** Redis sessions expire while the index does not, so restored vectors belonging to sessions that timed out during downtime are dropped instead of lingering as searchable orphans.
+- **Knowledge base files are content-hashed.** Re-ingesting blindly would duplicate the whole corpus on every restart. An unchanged file is skipped; an edited one supersedes its previous chunks.
+
+Set `PERSIST_INDEX=false` to keep everything in memory.
+
 ---
 
 ## Tools available to the agent
@@ -154,6 +165,10 @@ SEMANTIC_WEIGHT=0.7
 
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=200                         # carried across splits so context survives
+
+PERSIST_INDEX=true                        # index survives restarts
+MAX_QUERY_CHARS=4000                      # request bounds
+MAX_CUSTOM_DATA_ROWS=5000
 ```
 
 **Tuning.** Poor recall → raise `NUM_QUERY_VARIANTS` and `RETRIEVAL_CANDIDATES`, lower `RERANK_THRESHOLD`. Irrelevant passages → raise the threshold. Codes and identifiers matter more than phrasing → raise `BM25_WEIGHT`.
@@ -218,8 +233,8 @@ app/
 
 ## Known limitations
 
-- The FAISS index is in-memory and rebuilt on document removal; it does not survive a restart. Uploaded documents are re-ingested from `app/kb/` only.
 - BM25 is rebuilt per request rather than maintained incrementally — fine at this corpus size, the first thing to change as it grows.
+- The index is rebuilt in full when documents are removed. Acceptable at this scale; an IDMap-backed index would avoid it.
 - No authentication. Sessions are client-supplied UUIDs, which isolate data but do not authenticate it. Put this behind auth before exposing it.
 - Schema enforcement is stronger on OpenAI than on Gemini, for the API reasons above. Gemini relies on JSON mode plus a prompt-specified shape and a tolerant parser.
 - `matplotlib` is declared in `requirements.txt` but unused — charts are Plotly only. Safe to drop on the next rebuild.

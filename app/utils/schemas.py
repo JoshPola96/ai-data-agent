@@ -3,6 +3,10 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
+from app.core.config import get_settings
+
+_limits = get_settings()
+
 # ============================================================
 # FINAL RESPONSE SCHEMA
 # ============================================================
@@ -67,10 +71,15 @@ class AgentStep(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
-    query: str = Field(..., min_length=1)
+    # session_id lands in Redis keys, so the charset is restricted rather than trusted
+    session_id: Optional[str] = Field(
+        None,
+        max_length=_limits.MAX_SESSION_ID_CHARS,
+        pattern=r"^[A-Za-z0-9_\-]+$",
+    )
+    query: str = Field(..., min_length=1, max_length=_limits.MAX_QUERY_CHARS)
     use_rag: bool = True
-    model: Optional[str] = None
+    model: Optional[str] = Field(None, max_length=64)
 
 
 class ChatResponse(BaseModel):

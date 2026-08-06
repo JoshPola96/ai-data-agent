@@ -7,6 +7,7 @@ Version 5.0 - Optimized with enhanced debugging and chart support
 """
 
 import asyncio
+import hashlib
 import re
 import logging
 import uuid
@@ -78,6 +79,8 @@ async def lifespan(app: FastAPI):
         await retriever._initialize_reranker()
         logger.info("✅ Retriever initialized")
 
+        await prune_expired_sessions()
+
         if settings.AUTO_INGEST_ON_STARTUP:
             await auto_ingest_kb_folder()
 
@@ -119,6 +122,31 @@ _START = datetime.now(timezone.utc)
 # ============================================================
 
 
+async def prune_expired_sessions():
+    """
+    Drop restored vectors whose session has since expired in Redis.
+
+    The index outlives the process; Redis sessions do not. Without this, vectors
+    from sessions that timed out during downtime would linger and stay searchable
+    to whoever guessed the id.
+    """
+    sessions = {d.get("session_id") for d in await vector_store.get_documents()}
+    sessions.discard(settings.KB_SESSION_ID)
+    sessions.discard(None)
+
+    if not sessions:
+        return
+
+    live = {s for s in sessions if await session_store.session_exists(s)}
+    expired = sessions - live
+
+    if expired:
+        logger.info(f"🧹 {len(expired)} expired session(s) in restored index")
+        await vector_store.prune_sessions(
+            lambda sid: sid == settings.KB_SESSION_ID or sid in live
+        )
+
+
 async def auto_ingest_kb_folder():
     """Auto-ingest knowledge base folder"""
     kb_path = Path(settings.KB_FOLDER)
@@ -137,11 +165,28 @@ async def auto_ingest_kb_folder():
         logger.info("📁 KB folder is empty")
         return
 
-    logger.info(f"📚 Auto-ingesting {len(files)} KB files...")
+    logger.info(f"📚 Checking {len(files)} KB files...")
+
+    # The index is restored from disk before this runs, so re-ingesting blindly would
+    # duplicate the whole corpus on every restart. The content hash in doc_id makes an
+    # unchanged file a no-op and lets an edited one supersede its previous chunks.
+    indexed = {d.get("doc_id") for d in await vector_store.get_documents()}
+
     for f in files:
         try:
+            content = f.read_bytes()
+            doc_id = f"kb_{f.stem}_{hashlib.sha256(content).hexdigest()[:8]}"
+
+            if doc_id in indexed:
+                logger.info(f"  ⏭ {f.name}: unchanged, already indexed")
+                continue
+
+            removed = await vector_store.remove_by_source(f.name)
+            if removed:
+                logger.info(f"  ♻ {f.name}: replacing {removed} stale chunks")
+
             result = await ingestion_service.ingest_file(
-                settings.KB_SESSION_ID, f.name, f.read_bytes(), doc_id=f"kb_{f.stem}"
+                settings.KB_SESSION_ID, f.name, content, doc_id=doc_id
             )
             logger.info(
                 f"  ✓ {f.name}: {result['text_chunks']} chunks, {result['dataframes']} tables"

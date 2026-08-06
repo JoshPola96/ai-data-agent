@@ -6,7 +6,10 @@ High-performance FAISS-based vector database with GPU support and comprehensive 
 """
 
 import asyncio
+import json
 import logging
+import os
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -76,6 +79,7 @@ class VectorStore:
 
                 # Initialize FAISS index
                 self.index = faiss.IndexFlatIP(self.dim)
+                self._restore()
 
                 logger.info("✅ VectorStore initialized successfully")
                 logger.info(f"   Embedding Model: {settings.EMBEDDING_MODEL}")
@@ -90,6 +94,77 @@ class VectorStore:
                     f"❌ VectorStore initialization failed: {e}", exc_info=True
                 )
                 raise
+
+    def _paths(self) -> Tuple[Path, Path]:
+        base = Path(settings.INDEX_DIR)
+        return base / "index.faiss", base / "documents.json"
+
+    def _restore(self):
+        """Load a previously persisted index so uploads survive a restart."""
+        if not settings.PERSIST_INDEX:
+            return
+
+        index_path, docs_path = self._paths()
+        if not (index_path.exists() and docs_path.exists()):
+            logger.info("📂 No persisted index found, starting empty")
+            return
+
+        try:
+            documents = json.loads(docs_path.read_text(encoding="utf-8"))
+            index = faiss.read_index(str(index_path))
+
+            # A mismatch means the pair was written by a different model or a torn
+            # write; rebuilding from documents is safer than serving wrong vectors
+            if index.d != self.dim or index.ntotal != len(documents):
+                logger.warning(
+                    f"⚠️ Persisted index does not match documents "
+                    f"(dim {index.d}/{self.dim}, vectors {index.ntotal}/{len(documents)}), discarding"
+                )
+                return
+
+            self.documents = documents
+            self.index = index
+            logger.info(f"📂 Restored {index.ntotal} vectors from {index_path}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Could not restore index ({e}), starting empty")
+
+    def _persist(self):
+        """Write index and documents atomically so a crash cannot leave a torn pair."""
+        if not settings.PERSIST_INDEX or self.index is None:
+            return
+
+        index_path, docs_path = self._paths()
+
+        try:
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+
+            faiss.write_index(self.index, str(index_path) + ".tmp")
+            docs_path.with_suffix(".json.tmp").write_text(
+                json.dumps(self.documents), encoding="utf-8"
+            )
+
+            os.replace(str(index_path) + ".tmp", index_path)
+            os.replace(docs_path.with_suffix(".json.tmp"), docs_path)
+
+            logger.debug(f"💾 Persisted {self.index.ntotal} vectors")
+
+        except Exception as e:
+            logger.error(f"❌ Index persistence failed: {e}")
+
+    async def prune_sessions(self, keep) -> int:
+        """Drop documents whose session no longer exists; keep(session_id) decides."""
+        async with self._lock:
+            before = len(self.documents)
+            self.documents = [d for d in self.documents if keep(d.get("session_id"))]
+            removed = before - len(self.documents)
+
+            if removed:
+                await self._build_index()
+                self._persist()
+                logger.info(f"🧹 Pruned {removed} documents from expired sessions")
+
+        return removed
 
     async def add_documents(
         self, documents: List[Dict[str, str]], rebuild_index: bool = True
@@ -138,6 +213,8 @@ class VectorStore:
                 else:
                     logger.info("🔨 Building initial index...")
                     await self._build_index()
+
+                self._persist()
 
         logger.info("=" * 60)
         return len(documents)
@@ -235,23 +312,13 @@ class VectorStore:
         # Normalize
         faiss.normalize_L2(embeddings)
 
-        # Create index
-        if settings.DEVICE == "cuda" and faiss.get_num_gpus() > 0:
-            logger.info("   Creating GPU-accelerated FAISS index")
-            res = faiss.StandardGpuResources()
-            cpu_index = faiss.IndexFlatIP(self.dim)
-            self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-            self.index.add(embeddings)
-            logger.info(
-                f"✅ FAISS GPU index built in {asyncio.get_event_loop().time() - start_time:.2f}s"
-            )
-        else:
-            logger.info("   Creating CPU FAISS index")
-            self.index = faiss.IndexFlatIP(self.dim)
-            self.index.add(embeddings)
-            logger.info(
-                f"✅ FAISS CPU index built in {asyncio.get_event_loop().time() - start_time:.2f}s"
-            )
+        # The index always lives on CPU: this project ships faiss-cpu, which has no
+        # GPU support. Embedding and reranking still run on the GPU via torch.
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.index.add(embeddings)
+        logger.info(
+            f"✅ FAISS index built in {asyncio.get_event_loop().time() - start_time:.2f}s"
+        )
 
         logger.info(f"   Total vectors in index: {self.index.ntotal}")
 
@@ -322,7 +389,8 @@ class VectorStore:
         """Clear all documents and index"""
         async with self._lock:
             self.documents.clear()
-            self.index = None
+            self.index = faiss.IndexFlatIP(self.dim)
+            self._persist()
             logger.info("🗑️ Vector store cleared")
 
     async def remove_by_session(self, session_id: str) -> int:
@@ -336,6 +404,7 @@ class VectorStore:
 
             if removed_count > 0:
                 await self._build_index()
+                self._persist()
                 logger.info(
                     f"🗑️ Removed {removed_count} documents for session {session_id[:8]}"
                 )
@@ -351,6 +420,7 @@ class VectorStore:
 
             if removed_count > 0:
                 await self._build_index()
+                self._persist()
                 logger.info(
                     f"🗑️ Removed {removed_count} documents from source: {source}"
                 )
