@@ -17,6 +17,7 @@ import json
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*Parsing dates.*dayfirst.*")
+warnings.filterwarnings("ignore", message=".*Could not infer format.*")
 
 
 class ChartService:
@@ -69,6 +70,36 @@ class ChartService:
         return None
 
     @staticmethod
+    def resolve_ratio(df: pd.DataFrame, spec: str) -> Optional[Dict[str, str]]:
+        """
+        Materialise "returns/units" as a real column so rates can be plotted.
+
+        Rates, shares and per-unit values are the questions people actually ask, and
+        none of them exist as a column in the source data. Only a division of two
+        existing numeric columns is accepted — no expressions, no eval.
+
+        Returns the derived name alongside its source columns, because aggregating a
+        rate correctly means summing both sides and dividing once, not averaging the
+        per-row ratios.
+        """
+        if not spec or "/" not in spec:
+            return None
+
+        num, _, den = spec.partition("/")
+        num = ChartService._fuzzy_col_match(df, num.strip())
+        den = ChartService._fuzzy_col_match(df, den.strip())
+        if not num or not den:
+            return None
+
+        name = f"{num}_per_{den}"
+        df[num] = pd.to_numeric(df[num], errors="coerce")
+        df[den] = pd.to_numeric(df[den], errors="coerce")
+        df[name] = df[num] / df[den].replace(0, np.nan)
+
+        logger.info(f"  ➗ Derived '{name}' from {num}/{den}")
+        return {"name": name, "num": num, "den": den}
+
+    @staticmethod
     def _clean_and_sort_data(df: pd.DataFrame, x_col: str) -> pd.DataFrame:
         """Clean and sort data intelligently"""
         plot_df = df.copy()
@@ -97,6 +128,7 @@ class ChartService:
         aggregation: str,
         top_n: Optional[int] = None,
         color_col: Optional[str] = None,
+        ratio: Optional[Dict[str, str]] = None,
     ) -> pd.DataFrame:
         """Prepare data with cleaning, aggregation and optional top-N trimming"""
 
@@ -117,7 +149,13 @@ class ChartService:
             if color_col and color_col in df.columns and color_col != x_col:
                 keys.append(color_col)
 
-            if aggregation == "count":
+            if ratio and y_col == ratio["name"]:
+                # A rate aggregates as sum(numerator)/sum(denominator). Averaging the
+                # per-row ratios instead would weight a 2-unit row like a 2000-unit one.
+                df = df.groupby(keys, sort=False)[[ratio["num"], ratio["den"]]].sum().reset_index()
+                df[y_col] = df[ratio["num"]] / df[ratio["den"]].replace(0, np.nan)
+                logger.info(f"  ➗ Aggregated rate: sum({ratio['num']})/sum({ratio['den']}) by {keys}")
+            elif aggregation == "count":
                 df = df.groupby(keys, sort=False).size().reset_index(name="count")
                 y_col = "count"
                 logger.info(f"  📊 Aggregated: count by {keys}")
@@ -166,6 +204,31 @@ class ChartService:
             return "Chart created successfully."
 
     @staticmethod
+    def _value_format(df: pd.DataFrame, y_col: Optional[str]) -> str:
+        """
+        Pick a label format from the magnitude of the values.
+
+        SI notation is right for revenue (1.04M) and actively misleading for a rate:
+        it renders 0.0369 as "36.9m", meaning milli, next to charts labelled in
+        millions. Fractions read as percentages instead.
+        """
+        if not y_col or y_col not in df.columns:
+            return ".4g"
+
+        try:
+            peak = pd.to_numeric(df[y_col], errors="coerce").abs().max()
+        except Exception:
+            return ".4g"
+
+        if pd.isna(peak):
+            return ".4g"
+        if peak < 1:
+            return ".2%"
+        if peak >= 10_000:
+            return ".3s"
+        return ".4g"
+
+    @staticmethod
     def _create_plotly_figure(
         df: pd.DataFrame,
         chart_type: str,
@@ -177,6 +240,7 @@ class ChartService:
         """Create Plotly figure based on chart type"""
 
         logger.info(f"  🎨 Creating {chart_type} chart: {title}")
+        value_fmt = ChartService._value_format(df, y_col)
 
         if chart_type == "bar":
             fig = px.bar(
@@ -185,8 +249,9 @@ class ChartService:
                 y=y_col,
                 title=title,
                 color=color_column,
-                text_auto=True,  # Show values on bars
+                text_auto=value_fmt,
             )
+            fig.update_yaxes(tickformat=value_fmt)
 
         elif chart_type == "line":
             fig = px.line(
@@ -330,8 +395,11 @@ class ChartService:
 
             # Match columns
             x_col = ChartService._fuzzy_col_match(plot_df, x_column)
+            ratio = ChartService.resolve_ratio(plot_df, y_column) if y_column else None
             y_col = (
-                ChartService._fuzzy_col_match(plot_df, y_column) if y_column else None
+                ratio["name"]
+                if ratio
+                else (ChartService._fuzzy_col_match(plot_df, y_column) if y_column else None)
             )
             color_col = (
                 ChartService._fuzzy_col_match(plot_df, color_column)
@@ -359,7 +427,7 @@ class ChartService:
 
                 # Prepare data
                 plot_df = ChartService._prepare_data(
-                    plot_df, chart_type, x_col, y_col, aggregation, top_n, color_col
+                    plot_df, chart_type, x_col, y_col, aggregation, top_n, color_col, ratio
                 )
 
             if plot_df.empty:

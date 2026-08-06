@@ -61,6 +61,10 @@ Charts are a first-class output, not an afterthought. The agent picks the form t
 
 Ranking questions ("top 10 products by revenue") trim to `top_n` rather than plotting everything.
 
+**Rates are computed, not looked up.** `y_column` accepts `"returns/units"` to divide two numeric columns, because rates and per-unit values are what people ask about and exist in no source column. A rate aggregates as `sum(numerator) / sum(denominator)` — averaging per-row ratios would weight a 2-unit row the same as a 2000-unit one, which is a different and usually wrong statistic.
+
+**Labels are formatted by magnitude.** Revenue reads `2.46M`, a return rate reads `3.69%`, a count reads `1029`. SI notation everywhere would render `0.0369` as `36.9m` — milli, beside charts labelled in millions.
+
 **Dashboards in one call.** `generate_dashboard` renders up to six related figures from a single dataset — a trend, a breakdown and a distribution together. A malformed spec is isolated: the other charts still render, and the failure is reported next to them instead of losing the batch.
 
 **Column names are matched fuzzily.** The model asking for `revenue` still finds `Revenue_USD`, via case-insensitive then close-match resolution. Small thing, but it removes the most common cause of a failed chart.

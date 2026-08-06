@@ -200,7 +200,11 @@ Use `top_n` for ranking questions ("top 10 products by revenue").
                         },
                         "y_column": {
                             "type": "string",
-                            "description": "Column name for Y-axis (optional for histogram)",
+                            "description": (
+                                "Column for the Y-axis (optional for histogram/heatmap). "
+                                "Accepts a ratio of two numeric columns as 'a/b' — use this "
+                                "for rates and per-unit values, e.g. 'returns/units'."
+                            ),
                         },
                         "aggregation": {
                             "type": "string",
@@ -368,7 +372,11 @@ Calculate statistical measures on data.
                         },
                         "column": {
                             "type": "string",
-                            "description": "Column name (required for most operations)",
+                            "description": (
+                                "Column name (required for most operations). Accepts a "
+                                "ratio of two numeric columns as 'a/b' for rates, e.g. "
+                                "'returns/units' — aggregated as sum over sum."
+                            ),
                         },
                         "group_by": {
                             "type": "string",
@@ -615,10 +623,31 @@ async def _calculate_statistics(args: Dict, dfs: Dict) -> str:
             logger.error(f"  ❌ {error_msg}")
             return error_msg
 
+        # "returns/units" is accepted here exactly as it is by the chart tools, and
+        # aggregates the same way: sum both sides, divide once.
+        ratio = ChartService.resolve_ratio(df, column)
+        if ratio:
+            if group_by:
+                totals = df.groupby(group_by)[[ratio["num"], ratio["den"]]].sum()
+                result = totals[ratio["num"]] / totals[ratio["den"]].replace(0, np.nan)
+                output = f"Rate {ratio['num']}/{ratio['den']} by {group_by}:\n{result.to_string()}"
+            else:
+                total = df[ratio["den"]].sum()
+                rate = df[ratio["num"]].sum() / total if total else float("nan")
+                output = f"Overall {ratio['num']}/{ratio['den']}: {rate}"
+
+            logger.info(f"  ✅ {output[:120]}")
+            return output
+
+        column = ChartService._fuzzy_col_match(df, column) or column
+        if column not in df.columns:
+            return f"Column '{column}' not found. Available: {list(df.columns)}"
+
         # Convert to numeric
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
         if group_by:
+            group_by = ChartService._fuzzy_col_match(df, group_by) or group_by
             result = df.groupby(group_by)[column].agg(operation)
             output = f"{operation.capitalize()} of {column} by {group_by}:\n{result.to_string()}"
         else:

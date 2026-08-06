@@ -157,6 +157,91 @@ class NewChartTypesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(out["chart_json"]["data"][0]["x"]), 2)
 
 
+class RatioColumnTest(unittest.IsolatedAsyncioTestCase):
+    """Rates are the common question and exist in no source column."""
+
+    async def chart(self, **args):
+        raw = await execute_tool("generate_chart", {"table_name": "sales", **args}, {"sales": DF})
+        return json.loads(raw)
+
+    async def test_ratio_aggregates_as_sum_over_sum_not_mean_of_ratios(self):
+        """
+        A per-row mean would weight a 2-unit row like a 2000-unit one. The rate for a
+        group is sum(numerator) / sum(denominator), computed once.
+        """
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="units/revenue",
+            aggregation="mean", title="Units per revenue",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+
+        expected = DF.groupby("region")["units"].sum() / DF.groupby("region")["revenue"].sum()
+        xs = list(out["chart_json"]["data"][0]["x"])
+        ys = out["chart_json"]["data"][0]["y"]
+        ys = list(ys) if isinstance(ys, list) else None
+
+        if ys:  # plotly may emit a typed array; the ordering check still holds
+            for region, value in zip(xs, ys):
+                self.assertAlmostEqual(value, expected[region], places=6)
+
+        mean_of_ratios = (DF["units"] / DF["revenue"]).groupby(DF["region"]).mean()
+        self.assertNotAlmostEqual(
+            expected["North"], mean_of_ratios["North"], places=6,
+            msg="test data cannot distinguish the two aggregations",
+        )
+
+    async def test_unknown_column_in_ratio_falls_back_cleanly(self):
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="nonexistent/units",
+            aggregation="sum", title="Bad ratio",
+        )
+        self.assertIn("success", out)
+
+    async def test_plain_column_is_unaffected_by_ratio_handling(self):
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="revenue",
+            aggregation="sum", title="Plain",
+        )
+        self.assertTrue(out["success"], out.get("error"))
+
+    async def test_ratio_is_available_to_the_dashboard_tool(self):
+        raw = await execute_tool(
+            "generate_dashboard",
+            {"table_name": "sales", "charts": [
+                {"chart_type": "bar", "x_column": "region", "y_column": "units/revenue",
+                 "aggregation": "mean", "title": "Rate"},
+            ]},
+            {"sales": DF},
+        )
+        out = json.loads(raw)
+        self.assertTrue(out["success"], out.get("failures"))
+
+
+class LabelFormatTest(unittest.TestCase):
+    """
+    SI notation renders 0.0369 as "36.9m" — milli, not million. Beside a chart
+    labelled in millions that is worse than no formatting at all.
+    """
+
+    def fmt(self, values):
+        return ChartService._value_format(pd.DataFrame({"v": values}), "v")
+
+    def test_fractions_render_as_percentages(self):
+        self.assertEqual(self.fmt([0.0369, 0.0232, 0.0]), ".2%")
+
+    def test_large_values_use_si_notation(self):
+        self.assertEqual(self.fmt([2459372, 963930]), ".3s")
+
+    def test_mid_range_counts_stay_plain(self):
+        self.assertEqual(self.fmt([1029, 646, 369]), ".4g")
+
+    def test_missing_column_falls_back(self):
+        self.assertEqual(ChartService._value_format(pd.DataFrame({"v": [1]}), "absent"), ".4g")
+
+    def test_all_null_column_falls_back(self):
+        self.assertEqual(self.fmt([None, None]), ".4g")
+
+
 class CaptureChartsTest(unittest.TestCase):
     """Chart payloads must reach the response without passing through the model."""
 
