@@ -66,6 +66,8 @@ def upload_file(file):
         else:
             return False, resp.text
 
+    except requests.ConnectionError:
+        return False, "Backend unavailable — it may still be starting (~45s)."
     except Exception as e:
         return False, str(e)
 
@@ -98,6 +100,20 @@ def send_message(query, model=None):
                 "agent_trace": [],
             }
 
+    except requests.ConnectionError:
+        return {
+            "response": (
+                "⏳ **Backend unavailable.** It loads ~4GB of models on start, which takes "
+                "about 45 seconds. Wait a moment and send the message again — your uploaded "
+                "files are safe."
+            ),
+            "sources": [], "metadata": {}, "agent_trace": [],
+        }
+    except requests.Timeout:
+        return {
+            "response": "⏱️ **Request timed out.** Long documents with reranking can exceed the limit; try a narrower question.",
+            "sources": [], "metadata": {}, "agent_trace": [],
+        }
     except Exception as e:
         return {
             "response": f"Error: {str(e)}",
@@ -564,7 +580,14 @@ with st.sidebar:
 # ============================================================
 
 st.title("🤖 AI Data Agent")
-st.caption("Multi-document RAG with structured JSON outputs • Version 5.0")
+st.caption("Ask questions across your documents and spreadsheets — answers come back with charts")
+
+if status is None:
+    st.warning(
+        "⏳ Backend not reachable yet. It loads ~4GB of models on start, which takes about "
+        "45 seconds. This page will work normally once it is up.",
+        icon="⏳",
+    )
 
 # Display chat history
 for msg in st.session_state.messages:
@@ -619,22 +642,18 @@ if prompt := st.chat_input("Ask about your data..."):
                 for src in all_sources:
                     st.caption(f"• {src}")
 
-        # # Display agent trace (debug)
-        # if resp.get("agent_trace"):
-        #     render_agent_trace(resp["agent_trace"])
+        # What the agent actually did, and what it cost
+        if resp.get("agent_trace"):
+            render_agent_trace(resp["agent_trace"])
 
-        # # Display metadata (debug)
-        # if meta:
-        #     with st.expander("🔧 Metadata (Debug)", expanded=False):
-        #         st.json(
-        #             {
-        #                 "processing_time": meta.get("processing_time"),
-        #                 "turns_taken": meta.get("turns_taken"),
-        #                 "model_used": meta.get("model_used"),
-        #                 "num_visualizations": len(vizs),
-        #                 "num_insights": len(meta.get("key_insights", [])),
-        #             }
-        #         )
+        if meta:
+            tools = len([s for s in resp.get("agent_trace", []) if s["type"] == "tool_call"])
+            st.caption(
+                f"⚡ {meta.get('processing_time', '?')}s · "
+                f"{meta.get('turns_taken', '?')} turns · "
+                f"{tools} tool calls · "
+                f"{meta.get('model_used', 'unknown')}"
+            )
 
     # Save to history
     st.session_state.messages.append(
@@ -659,30 +678,30 @@ if not st.session_state.messages:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown("**📄 Document Analysis**")
+        st.markdown("**📄 Document Q&A**")
         st.markdown("""
-        - "Summarize all documents"
+        - "Summarise all documents"
         - "What does it say about X?"
         - "Compare documents A and B"
-        - "Extract key findings"
+        - Ask in any language — answers come back in the same one
         """)
 
     with col2:
-        st.markdown("**📊 Data Visualization**")
+        st.markdown("**📊 Charts & Dashboards**")
         st.markdown("""
-        - "Show sales by region"
-        - "Create a trend chart"
-        - "Visualize quarterly data"
-        - "Compare year over year"
+        - "Build a dashboard: revenue by region, trend by quarter, units vs revenue"
+        - "Show the margin distribution per region"
+        - "Which columns correlate?"
+        - "Top 10 products by revenue"
         """)
 
     with col3:
-        st.markdown("**🔢 Statistical Analysis**")
+        st.markdown("**🔢 Analysis**")
         st.markdown("""
-        - "What's the average revenue?"
-        - "Calculate correlation"
-        - "Show top 10 products"
-        - "Find anomalies"
+        - "What's the average revenue by region?"
+        - "Describe the dataset"
+        - "Filter to Q4 and sort by margin"
+        - "Chart the figures in this PDF"
         """)
 
 # Footer

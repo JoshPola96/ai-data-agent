@@ -1,435 +1,181 @@
-# AI Data Agent - Deployment & Optimization Guide
+# Operations Guide
 
-## Quick Start
+Tuning, troubleshooting and production notes. Start with the [README](README.md) for what the project is and how to run it.
 
-### 1. Setup
+---
+
+## Configuration presets
+
+Every value lives in `.env`. Restart the backend to apply — note that `docker compose restart` reuses the existing container's environment, so changes to `.env` need a recreate:
 
 ```bash
-# Clone or extract project
-cd ai_data_agent
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env and add your OpenAI API key
-nano .env  # or use your preferred editor
+docker compose up -d --force-recreate backend
 ```
 
-### 2. Run with Docker (Recommended)
+### By document type
+
+| | Long reports, books | Articles (default) | Emails, short notes | Contracts, legal |
+|---|---|---|---|---|
+| `CHUNK_SIZE` | 1500 | 1000 | 500 | 800 |
+| `CHUNK_OVERLAP` | 300 | 200 | 100 | 240 |
+| `MIN_CHUNK_SIZE` | 200 | 100 | 50 | 100 |
+| `RETRIEVAL_TOP_K` | 7 | 5 | 4 | 5 |
+| `RERANK_THRESHOLD` | 0.30 | 0.35 | 0.35 | 0.50 |
+
+Larger chunks preserve argument and context; smaller ones sharpen retrieval precision. Overlap carries context across a split so a sentence cut in half is still findable from either side.
+
+### By priority
+
+**Accuracy** — more query phrasings, a wider candidate pool, strict reranking:
 
 ```bash
-./start.sh docker
-
-# Or manually:
-docker-compose up -d
-```
-
-### 3. Run Locally
-
-```bash
-./start.sh local
-
-# Or manually:
-# Terminal 1: Start Redis
-redis-server
-
-# Terminal 2: Start Backend
-python -m uvicorn app.main:app --reload --port 8000
-
-# Terminal 3: Start Frontend
-streamlit run app/frontend.py --server.port 8501
-```
-
-### 4. Access
-
-- Frontend UI: http://localhost:8501
-- Backend API: http://localhost:8000
-- API Documentation: http://localhost:8000/docs
-
-## Performance Optimization
-
-### RAG Pipeline Tuning
-
-#### For Maximum Quality
-```bash
-# .env settings
-EMBEDDING_MODEL=BAAI/bge-m3
-USE_RERANKING=true
-RETRIEVAL_CANDIDATES=30
-RETRIEVAL_TOP_K=7
-RERANK_THRESHOLD=0.5
 USE_MULTI_QUERY=true
-NUM_QUERY_VARIANTS=3
-```
-
-**Trade-offs:**
-- ✅ Best retrieval accuracy
-- ✅ Better handling of complex queries
-- ❌ Slower (2-3x)
-- ❌ Higher memory usage
-
-#### For Maximum Speed
-```bash
-# .env settings
-EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
-USE_RERANKING=false
-RETRIEVAL_CANDIDATES=10
-RETRIEVAL_TOP_K=3
-USE_MULTI_QUERY=false
-```
-
-**Trade-offs:**
-- ✅ Very fast responses
-- ✅ Low memory usage
-- ❌ May miss relevant documents
-- ❌ Less precise for complex queries
-
-#### Balanced (Recommended)
-```bash
-# .env settings (default)
-EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+NUM_QUERY_VARIANTS=5
+RETRIEVAL_CANDIDATES=30
 USE_RERANKING=true
-RETRIEVAL_CANDIDATES=20
-RETRIEVAL_TOP_K=5
-RERANK_THRESHOLD=0.35
+RERANK_THRESHOLD=0.45
+```
+
+**Speed** — one search, no cross-encoder. Roughly halves latency and drops the reranker's memory entirely:
+
+```bash
 USE_MULTI_QUERY=false
+RETRIEVAL_CANDIDATES=10
+USE_RERANKING=false
 ```
 
-### Chunking Strategy
-
-#### For Long Documents (reports, books)
-```bash
-CHUNK_SIZE=1500
-CHUNK_OVERLAP=300
-MIN_CHUNK_SIZE=200
-```
-
-#### For Short Documents (emails, articles)
-```bash
-CHUNK_SIZE=500
-CHUNK_OVERLAP=100
-MIN_CHUNK_SIZE=50
-```
-
-#### For Technical/Structured Content
-```bash
-CHUNK_SIZE=800
-CHUNK_OVERLAP=150
-MIN_CHUNK_SIZE=100
-```
-
-### Hybrid Search Weights
-
-#### For Keyword-Heavy Queries (exact terms, names, codes)
-```bash
-BM25_WEIGHT=0.7
-SEMANTIC_WEIGHT=0.3
-```
-
-#### For Conceptual Queries (meaning, themes)
-```bash
-BM25_WEIGHT=0.3
-SEMANTIC_WEIGHT=0.7
-```
-
-#### Balanced
-```bash
-BM25_WEIGHT=0.3
-SEMANTIC_WEIGHT=0.7
-```
-
-## Advanced Configuration
-
-### LLM Selection
-
-#### Production
-```bash
-DEFAULT_MODEL=gpt-5.2             # Best quality
-FALLBACK_MODEL=gemini:gemini-flash-latest   # Cross-provider backup
-LLM_TEMPERATURE=0.1               # Consistent, factual
-```
-
-#### Cost Optimization
-```bash
-DEFAULT_MODEL=gpt-5-mini          # Cheaper
-FALLBACK_MODEL=gemini:gemini-flash-latest   # Cheap backup
-LLM_TEMPERATURE=0.1
-```
-
-#### Creative Analysis
-```bash
-DEFAULT_MODEL=gpt-5.2
-LLM_TEMPERATURE=0.3               # More creative
-```
-
-### Session Management
-
-#### Short Sessions (chat-like)
-```bash
-SESSION_TTL=1800          # 30 minutes
-MAX_CHAT_HISTORY=5
-```
-
-#### Long Sessions (research)
-```bash
-SESSION_TTL=7200          # 2 hours
-MAX_CHAT_HISTORY=15
-```
-
-### File Upload Limits
+**Cost** — query expansion spends one extra LLM call per question. Disabling it is the single biggest saving:
 
 ```bash
-# For large datasets
-MAX_FILE_SIZE_MB=100
-
-# For constrained environments
-MAX_FILE_SIZE_MB=20
+USE_MULTI_QUERY=false
+DEFAULT_MODEL=gemini:gemini-2.5-flash
+MAX_CHAT_HISTORY=10
 ```
 
-## Monitoring & Debugging
+### By language
 
-### Check System Status
+`BAAI/bge-m3` (default) covers 100+ languages at 1024 dimensions, and lets a question in one language retrieve passages written in another. English-only alternatives are smaller and faster:
 
 ```bash
-# Health check
-curl http://localhost:8000/health
-
-# System status
-curl http://localhost:8000/status
-
-# View logs (Docker)
-docker-compose logs -f backend
-docker-compose logs -f frontend
+# English only, ~440MB instead of ~2.2GB
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+EMBEDDING_DIM=768
+RERANKER_MODEL=BAAI/bge-reranker-base
 ```
 
-### Common Issues
+`EMBEDDING_DIM` must match the model. If it doesn't, the mismatch is detected at startup and the real dimension wins — but a persisted index built at the old dimension is discarded, so the corpus needs re-ingesting.
 
-#### Out of Memory
-**Symptoms:** Process crashes, slow responses
-**Solutions:**
-1. Reduce `CHUNK_SIZE` to 500-800
-2. Decrease `RETRIEVAL_CANDIDATES` to 10-15
-3. Use smaller embedding model
-4. Disable reranking for large documents
+### Hybrid search balance
 
-#### Slow Retrieval
-**Symptoms:** Long wait times for responses
-**Solutions:**
-1. Set `USE_RERANKING=false`
-2. Reduce `RETRIEVAL_CANDIDATES` to 10
-3. Use a smaller embedding model such as `BAAI/bge-base-en-v1.5` (768 dim)
-4. Disable multi-query
+`BM25_WEIGHT` and `SEMANTIC_WEIGHT` set how lexical and semantic hits are weighted during fusion.
 
-#### Poor Retrieval Quality
-**Symptoms:** Irrelevant documents retrieved
-**Solutions:**
-1. Enable reranking: `USE_RERANKING=true`
-2. Increase `RERANK_THRESHOLD` to 0.4-0.5
-3. Use the multilingual default: `BAAI/bge-m3` (1024 dim)
-4. Adjust hybrid search weights
-5. Increase `RETRIEVAL_CANDIDATES` to 25-30
+| Corpus | BM25 | Semantic |
+|---|---|---|
+| Codes, part numbers, names | 0.7 | 0.3 |
+| General documents (default) | 0.3 | 0.7 |
+| Conceptual, cross-language | 0.2 | 0.8 |
 
-#### Redis Connection Issues
-```bash
-# Check Redis
-redis-cli ping
+Raise BM25 when users search for exact strings; raise semantic when they describe what they mean.
 
-# Restart Redis
-redis-server --daemonize yes
+---
 
-# Or with Docker
-docker restart ai_agent_redis
-```
+## Measured performance
 
-## Production Deployment
+On an RTX 3050 Laptop (4GB VRAM), `gemini-2.5-flash`, 89-chunk corpus:
 
-### Environment Variables (Must Set)
+| Operation | Time |
+|---|---|
+| Embed 64 texts (GPU) | 0.50s |
+| Analysis + one chart | 8–9s |
+| Three-chart dashboard | 11–13s |
+| RAG query, cross-language | 25–30s |
+| Cold start (models into VRAM) | ~45s |
+
+RAG queries dominate because they add query expansion, hybrid search over every variant, and cross-encoder reranking before the answer call. Turn off `USE_MULTI_QUERY` and `USE_RERANKING` to see the floor.
+
+These are one machine's numbers, not a benchmark. Measure your own.
+
+---
+
+## Hardware
+
+GPU is auto-detected; without one, everything runs on CPU. `DEVICE` in the logs at startup tells you which path is live.
+
+| | Embedder | Reranker | Total |
+|---|---|---|---|
+| `bge-m3` + `bge-reranker-v2-m3` | ~2.1GB | ~2.1GB | ~4.2GB VRAM |
+| English alternatives | ~0.5GB | ~0.5GB | ~1.0GB VRAM |
+
+On a 4GB card the multilingual pair sits right at the edge. If loading fails, set `USE_RERANKING=false` to drop the second model, or force CPU:
 
 ```bash
-# Required
-OPENAI_API_KEY=sk-...
-
-# Recommended
-LOG_LEVEL=WARNING          # Reduce noise
-SESSION_TTL=7200          # 2 hours
-MAX_FILE_SIZE_MB=50
+CUDA_VISIBLE_DEVICES= docker compose up -d --force-recreate backend
 ```
 
-### Security Considerations
+The FAISS index itself always runs on CPU — this project ships `faiss-cpu`. Only embedding and reranking use CUDA.
 
-1. **API Keys**: Never commit `.env` to version control
-2. **Redis**: Use password authentication in production
-3. **File Upload**: Implement virus scanning for uploads
-4. **Rate Limiting**: Add rate limits to endpoints
-5. **HTTPS**: Use reverse proxy (nginx) with SSL
+---
+
+## Operations
+
+```bash
+docker compose ps                     # container health
+docker compose logs -f backend        # follow the agent loop
+curl localhost:8000/status            # documents, vectors, active model
+curl localhost:8000/health            # liveness
+
+docker compose exec backend python -m unittest discover -s tests -t .   # 73 offline tests
+docker compose exec backend python tests/e2e.py                         # end-to-end, spends API calls
+```
+
+The backend logs each turn of the agent loop: the tools it chose, what they returned, and how long the whole request took. That log is the fastest way to understand a disappointing answer.
+
+---
+
+## Troubleshooting
+
+**Answers say the service is unavailable.** Both providers failed. Check the log for the underlying error — a 429 with `insufficient_quota` means the account is out of credit (never retried, by design); a 429 with `RESOURCE_EXHAUSTED` is a rate limit and does get retried with backoff.
+
+**Retrieval misses obvious content.** Lower `RERANK_THRESHOLD` first — it is the most common cause, since passages are dropped after reranking. Then raise `RETRIEVAL_CANDIDATES`, then `NUM_QUERY_VARIANTS`.
+
+**Retrieval returns irrelevant passages.** The opposite: raise `RERANK_THRESHOLD` toward 0.5.
+
+**A knowledge base file did not appear.** The folder is only read at startup, and files are content-hashed — an unchanged file is skipped deliberately. Restart after adding one. Check the log for `⏭ unchanged` versus `✓ … chunks`.
+
+**Out of memory on upload.** Lower `EMBEDDING_BATCH_SIZE` to 8 or 16, and `CHUNK_SIZE` to 500.
+
+**Redis connection refused.** `docker compose ps` should show `ai_agent_redis` healthy. Sessions, chat history and dataframes all live there; the vector index does not, so a Redis restart loses conversations but not documents.
+
+**The index looks wrong after changing the embedding model.** Dimensions no longer match, so the persisted index is discarded on load. Re-ingest, or delete the volume: `docker compose down && docker volume rm fileuploader_chatbot_index_data`.
+
+---
+
+## Production notes
+
+This runs as a demo out of the box. Before exposing it:
+
+- **Add authentication.** Session ids are client-supplied. They isolate data but do not authenticate it — anyone who guesses an id inherits that session until it expires.
+- **Set `CORS_ORIGINS`** to your real frontend origin. It ships restricted to localhost.
+- **Set `DEBUG_MODE=false`** and `LOG_LEVEL=WARNING`. Debug logging includes document content and tool arguments.
+- **Put the API behind a rate limiter.** Every request can trigger several LLM calls, so an unmetered endpoint is a billing risk more than a load one.
+- **Mount `/app/data` on durable storage.** The index is written there; a named volume is fine for one host, but not for a cluster.
 
 ### Scaling
 
-#### Horizontal Scaling
-```yaml
-# docker-compose.yml
-services:
-  backend:
-    deploy:
-      replicas: 3
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-```
+Two pieces of state prevent naive horizontal scaling:
 
-#### Load Balancing
-```nginx
-# nginx.conf
-upstream backend {
-    server backend1:8000;
-    server backend2:8000;
-    server backend3:8000;
-}
-```
+- **The vector index is per-process and in-memory.** Two backend replicas hold two different indexes, so a request will hit one or the other. A shared vector database (Qdrant, pgvector, Milvus) is the real fix.
+- **`llm_service.model` is process-global.** Switching model via `/models/select` affects every user on that replica.
 
-### Resource Requirements
+Redis already handles sessions, chat history and dataframes correctly across replicas.
 
-#### Minimum
-- CPU: 2 cores
-- RAM: 4GB
-- Disk: 10GB
-
-#### Recommended
-- CPU: 4 cores
-- RAM: 8GB
-- Disk: 50GB
-
-#### High Performance
-- CPU: 8+ cores
-- RAM: 16GB+
-- Disk: 100GB+ SSD
-
-## Customization
-
-### Adding New File Formats
-
-Edit `app/services/ingest.py`:
-
-```python
-def _parse_custom_format(self, filename, content, doc_id):
-    # Your parsing logic
-    text = extract_text(content)
-    dataframes = extract_tables(content)
-    return text, dataframes
-
-# Register parser
-parsers = {
-    'custom': self._parse_custom_format,
-    # ... existing parsers
-}
-```
-
-### Custom Tools
-
-Edit `app/services/tools.py`:
-
-```python
-async def execute_tool(tool_name, arguments, dataframes):
-    if tool_name == "my_custom_tool":
-        return await _my_custom_tool(arguments, dataframes)
-    # ... existing tools
-```
-
-### Custom Prompts
-
-Edit `app/utils/prompts.py`:
-
-```python
-def get_system_prompt(context, dataframes_info):
-    prompt = f"""
-    [Your custom instructions]
-    
-    Context: {context}
-    Tables: {dataframes_info}
-    """
-    return prompt
-```
-
-## Best Practices
-
-### Document Preparation
-
-1. **Clean PDFs**: Remove headers/footers that repeat
-2. **Table Extraction**: Use well-formatted tables
-3. **File Naming**: Use descriptive names
-4. **Organization**: Group related files in KB folder
-
-### Query Formulation
-
-**Good Queries:**
-- "Show me revenue trends by quarter"
-- "What are the top 5 products by sales?"
-- "Summarize the risks mentioned in section 3"
-
-**Poor Queries:**
-- "Tell me about it" (too vague)
-- "Everything about sales" (too broad)
-- Very long multi-part questions (split them)
-
-### Data Analysis
-
-1. **Start Simple**: Begin with basic stats before complex viz
-2. **Validate**: Check data types match expected operations
-3. **Iterate**: Refine queries based on initial results
-4. **Combine**: Mix document Q&A with data analysis
-
-## Troubleshooting Checklist
-
-- [ ] Redis is running (`redis-cli ping`)
-- [ ] `.env` file exists with valid API key
-- [ ] Python dependencies installed (`pip install -r requirements.txt`)
-- [ ] Ports 8000 and 8501 are available
-- [ ] Sufficient disk space for embeddings cache
-- [ ] Files in KB folder have supported extensions
-- [ ] Check logs for specific errors
-
-## Performance Benchmarks
-
-Typical performance (MacBook Pro M1, 16GB RAM):
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Upload PDF (10 pages) | 2-3s | Including chunking & embedding |
-| Upload Excel (1000 rows) | 1-2s | Including indexing |
-| Simple query | 0.5-1s | Without reranking |
-| Complex query | 1-3s | With reranking |
-| Chart generation | 0.5-1s | Matplotlib rendering |
-| Statistics calculation | 0.2-0.5s | Pandas operations |
-
-## Support
-
-For issues:
-1. Check logs: `docker-compose logs -f`
-2. Review configuration in `.env`
-3. Test API directly: `http://localhost:8000/docs`
-4. Verify Redis: `redis-cli ping`
-5. Check disk space and memory
-
-## Maintenance
-
-### Regular Tasks
-
-```bash
-# Clear Redis cache
-redis-cli FLUSHDB
-
-# Clean Docker volumes
-docker-compose down -v
-
-# Update dependencies
-pip install -U -r requirements.txt
-```
+Vertical scaling is the simpler path here: one backend with a GPU handles a lot, because the expensive parts (embedding, reranking) are batched and the LLM calls are I/O-bound and fully async.
 
 ### Backup
 
 ```bash
-# Backup KB folder
-tar -czf kb_backup.tar.gz kb/
-
-# Export Redis data
-redis-cli BGSAVE
+docker run --rm -v fileuploader_chatbot_index_data:/d -v "$PWD:/b" alpine tar czf /b/index.tar.gz -C /d .
+docker compose exec redis redis-cli SAVE
 ```
+
+The knowledge base folder is the source of truth for shared documents — back that up and the index can always be rebuilt by restarting.

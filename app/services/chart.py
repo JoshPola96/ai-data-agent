@@ -95,8 +95,9 @@ class ChartService:
         x_col: str,
         y_col: Optional[str],
         aggregation: str,
+        top_n: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Prepare data with cleaning and aggregation"""
+        """Prepare data with cleaning, aggregation and optional top-N trimming"""
 
         # Categorical charts need string x-axis
         if chart_type in ["bar", "pie"]:
@@ -116,6 +117,11 @@ class ChartService:
             elif y_col:
                 df = df.groupby(x_col, sort=False)[y_col].agg(aggregation).reset_index()
                 logger.info(f"  📊 Aggregated: {aggregation}({y_col}) by {x_col}")
+
+        # "Top 10 products by revenue" is a ranking, not a full plot
+        if top_n and y_col and y_col in df.columns:
+            df = df.nlargest(int(top_n), y_col)
+            logger.info(f"  🔝 Trimmed to top {top_n} by {y_col}")
 
         return df
 
@@ -216,9 +222,36 @@ class ChartService:
                 marginal="box",  # Add box plot on top
             )
 
+        elif chart_type == "box":
+            fig = px.box(
+                df,
+                x=x_col,
+                y=y_col,
+                title=title,
+                color=color_column,
+                points="outliers",  # Spread plus the values that break it
+            )
+
+        elif chart_type == "heatmap":
+            # Correlation is the one statistic that is unreadable as text
+            numeric = df.select_dtypes(include=[np.number])
+            fig = px.imshow(
+                numeric.corr(),
+                title=title,
+                text_auto=".2f",
+                aspect="auto",
+                zmin=-1,
+                zmax=1,
+                color_continuous_scale="RdBu_r",
+            )
+
         else:
             # Default to bar chart
             fig = px.bar(df, x=x_col, y=y_col, title=title)
+
+        # Side-by-side reads better than stacked when a series is broken out
+        if color_column and chart_type == "bar":
+            fig.update_layout(barmode="group")
 
         return fig
 
@@ -259,6 +292,7 @@ class ChartService:
         aggregation: str = "none",
         title: str = "Chart",
         color_column: Optional[str] = None,
+        top_n: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -293,20 +327,28 @@ class ChartService:
                 ChartService._fuzzy_col_match(plot_df, y_column) if y_column else None
             )
 
-            if not x_col:
+            # A correlation heatmap spans every numeric column, so it has no x-axis
+            if chart_type == "heatmap":
+                if plot_df.select_dtypes(include=[np.number]).shape[1] < 2:
+                    return {
+                        "success": False,
+                        "error": "Heatmap needs at least two numeric columns",
+                    }
+            elif not x_col:
                 error_msg = (
                     f"Column '{x_column}' not found. Available: {list(plot_df.columns)}"
                 )
                 logger.error(f"  ❌ {error_msg}")
                 return {"success": False, "error": error_msg}
 
-            # Clean and sort
-            plot_df = ChartService._clean_and_sort_data(plot_df, x_col)
+            if x_col:
+                # Clean and sort
+                plot_df = ChartService._clean_and_sort_data(plot_df, x_col)
 
-            # Prepare data
-            plot_df = ChartService._prepare_data(
-                plot_df, chart_type, x_col, y_col, aggregation
-            )
+                # Prepare data
+                plot_df = ChartService._prepare_data(
+                    plot_df, chart_type, x_col, y_col, aggregation, top_n
+                )
 
             if plot_df.empty:
                 error_msg = "No data remaining after processing"

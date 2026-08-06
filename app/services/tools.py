@@ -166,11 +166,15 @@ Create Plotly charts from tabular data.
 {data_guidance}
 
 **Supported Chart Types:**
-- bar: Bar chart (categorical comparisons)
-- line: Line chart (trends over time)
-- pie: Pie chart (proportions, max 10 categories)
-- scatter: Scatter plot (correlations)
-- histogram: Distribution histogram
+- bar: categorical comparison; set `color_column` to break series out side by side
+- line: trend over time or ordered categories
+- pie: proportions of a whole (top 10 slices)
+- scatter: relationship between two numeric columns
+- histogram: distribution of one numeric column
+- box: distribution and outliers, optionally split by a category on x
+- heatmap: correlation matrix across all numeric columns (no x_column needed)
+
+Use `top_n` for ranking questions ("top 10 products by revenue").
 """,
                 "parameters": {
                     "type": "object",
@@ -188,7 +192,7 @@ Create Plotly charts from tabular data.
                         "chart_type": {
                             "type": "string",
                             "description": "Type of chart to create",
-                            "enum": ["bar", "line", "pie", "scatter", "histogram"],
+                            "enum": ["bar", "line", "pie", "scatter", "histogram", "box", "heatmap"],
                         },
                         "x_column": {
                             "type": "string",
@@ -212,8 +216,14 @@ Create Plotly charts from tabular data.
                             "type": "string",
                             "description": "Column to use for color grouping (optional)",
                         },
+                        "top_n": {
+                            "type": "integer",
+                            "description": "Keep only the highest N rows by y_column, for ranking questions",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
                     },
-                    "required": ["chart_type", "x_column", "title"],
+                    "required": ["chart_type", "title"],
                 },
             },
         },
@@ -274,8 +284,9 @@ Prefer this over calling generate_chart repeatedly.
                                     },
                                     "title": {"type": "string"},
                                     "color_column": {"type": "string"},
+                                    "top_n": {"type": "integer", "minimum": 1, "maximum": 50},
                                 },
-                                "required": ["chart_type", "x_column", "title"],
+                                "required": ["chart_type", "title"],
                             },
                         },
                     },
@@ -498,6 +509,7 @@ async def _generate_chart(args: Dict, dfs: Dict) -> str:
         aggregation=args.get("aggregation", "none"),
         title=args.get("title", "Chart"),
         color_column=args.get("color_column"),
+        top_n=args.get("top_n"),
     )
 
     # Convert numpy types for JSON serialization
