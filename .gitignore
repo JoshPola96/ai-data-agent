@@ -1,0 +1,71 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Secrets
+secrets.toml
+.env
+*.key
+*.pem
+
+# Knowledge base holds user-supplied documents; keep the folder, never the contents
+app/kb/*
+!app/kb/.gitkeep
+!app/kb/README.md
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.pkl
+*.pickle
+embeddings_cache.pkl
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Redis
+dump.rdb
+
+# Temporary files
+*.tmp
+temp/
+tmp/

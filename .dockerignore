@@ -1,0 +1,38 @@
+# .dockerignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Data and Logs
+*.log
+*.parquet
+sessions/
+faiss_indices/
+
+# Environment and Secrets
+.env
+secrets.toml
+
+# User documents are bind-mounted at runtime; never bake them into the image
+app/kb/*
+!app/kb/.gitkeep
+!app/kb/README.md
+
+# IDEs
+.vscode/
+.idea/
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Git
+.git
+.gitignore

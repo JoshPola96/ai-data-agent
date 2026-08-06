@@ -1,0 +1,31 @@
+# --- LAYER 1: HEAVY AI CORE ---
+# Default PyPI torch ships CUDA 13 wheels; config.py auto-detects and falls back to CPU.
+torch
+sentence-transformers
+faiss-cpu
+rank-bm25
+
+# --- LAYER 2: BACKEND & INFRA ---
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+redis[hiredis]
+aiofiles
+python-multipart
+python-dotenv
+
+# --- LAYER 3: DOC PARSING & TOOLS ---
+pdfplumber
+python-docx
+pandas
+openpyxl
+xlrd
+tabulate
+streamlit
+plotly
+matplotlib
+google-genai
+openai
+numpy
+orjson
