@@ -12,6 +12,13 @@ Every value lives in `.env`. Restart the backend to apply — note that `docker 
 docker compose up -d --force-recreate backend
 ```
 
+Hot reload during development lives in an override rather than the default file, since
+`--reload` restarts the backend on every edit and each start reloads ~2GB of models:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+```
+
 ### By document type
 
 | | Long reports, books | Articles (default) | Emails, short notes | Contracts, legal |
