@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Tuple
 import faiss
 from sentence_transformers import SentenceTransformer
 from app.core.config import get_settings
+from app.core.gpu import infer
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -53,17 +54,15 @@ class VectorStore:
             logger.info(f"Device: {settings.DEVICE}")
             logger.info(f"Dimension: {settings.EMBEDDING_DIM}")
 
-            # Load model in thread pool
-            loop = asyncio.get_event_loop()
-
             try:
-                self.embedder = await loop.run_in_executor(
-                    None,
+                self.embedder = await infer(
                     lambda: SentenceTransformer(
                         settings.EMBEDDING_MODEL,
                         device=settings.DEVICE,
                         cache_folder=settings.HF_HOME,
+                        model_kwargs={"torch_dtype": settings.MODEL_DTYPE},
                     ),
+                    "load embedder",
                 )
 
                 # Verify model dimension
@@ -234,21 +233,19 @@ class VectorStore:
             f"avg={sum(len(c) for c in contents) // len(contents)}"
         )
 
-        loop = asyncio.get_event_loop()
-
         logger.debug(
             f"   Embedding {len(contents)} texts with batch_size={settings.EMBEDDING_BATCH_SIZE}"
         )
 
-        embeddings = await loop.run_in_executor(
-            None,
+        embeddings = await infer(
             lambda: self.embedder.encode(
                 contents,
                 batch_size=settings.EMBEDDING_BATCH_SIZE,
                 convert_to_numpy=True,
-                show_progress_bar=settings.DEBUG_MODE,
+                show_progress_bar=False,
                 device=settings.DEVICE,
             ).astype("float32"),
+            "embed batch",
         )
 
         logger.debug(f"   Embedding shape: {embeddings.shape}")
@@ -289,22 +286,19 @@ class VectorStore:
             f"     Avg length: {sum(len(c) for c in contents) // len(contents)}"
         )
 
-        # Embed in batches
-        loop = asyncio.get_event_loop()
-
         logger.info(
             f"   Encoding {len(contents)} texts (batch_size={settings.EMBEDDING_BATCH_SIZE})"
         )
 
-        embeddings = await loop.run_in_executor(
-            None,
+        embeddings = await infer(
             lambda: self.embedder.encode(
                 contents,
                 batch_size=settings.EMBEDDING_BATCH_SIZE,
                 convert_to_numpy=True,
-                show_progress_bar=settings.DEBUG_MODE,
+                show_progress_bar=False,
                 device=settings.DEVICE,
             ).astype("float32"),
+            "embed batch",
         )
 
         logger.debug(f"   Generated embeddings shape: {embeddings.shape}")
@@ -351,12 +345,11 @@ class VectorStore:
         logger.debug(f"🔍 Searching: query='{query[:100]}...', top_k={top_k}")
 
         # Embed query
-        loop = asyncio.get_event_loop()
-        query_vec = await loop.run_in_executor(
-            None,
+        query_vec = await infer(
             lambda: self.embedder.encode(
                 [query], convert_to_numpy=True, device=settings.DEVICE
             ).astype("float32"),
+            "embed query",
         )
         faiss.normalize_L2(query_vec)
 

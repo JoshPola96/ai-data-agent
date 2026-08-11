@@ -336,7 +336,10 @@ class LLMService:
                             name=tc["name"], args=tc["arguments"]
                         )
                     )
-                    if tc.get("thought_signature"):
+                    if (
+                        tc.get("thought_signature")
+                        and tc.get("signature_model") == model_name
+                    ):
                         part.thought_signature = tc["thought_signature"]
                     parts.append(part)
 
@@ -443,10 +446,14 @@ class LLMService:
                             "id": f"call_{part.function_call.name}_{uuid.uuid4().hex[:4]}",
                             "name": part.function_call.name,
                             "arguments": dict(part.function_call.args),
-                            # Carried so the call can be replayed on the next turn
+                            # Carried so the call can be replayed on the next turn.
+                            # Tagged with its issuer: a signature from one model is
+                            # rejected by another, which broke every failover that
+                            # happened mid-conversation.
                             "thought_signature": getattr(
                                 part, "thought_signature", None
                             ),
+                            "signature_model": model_name,
                         }
                     )
 

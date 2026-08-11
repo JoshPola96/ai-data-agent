@@ -71,6 +71,36 @@ def _create_data_profile(df: pd.DataFrame, table_name: str) -> str:
         return f"Table: {table_name} (Error generating profile: {e})"
 
 
+def build_table_context(dfs: Dict[str, pd.DataFrame], profile_limit: int = 5) -> str:
+    """
+    Describe every available table, profiling only the most recent few.
+
+    A full profile costs real tokens, but omitting a table entirely is worse: the
+    agent cannot know it exists and burns turns probing with query_data to find out.
+    Twenty-four one-row payslip tables exhausted a ten-turn budget this way. Every
+    table therefore gets a one-line schema; the newest get the detail.
+    """
+    if not dfs:
+        return "No structured data available."
+
+    newest_first = list(dfs.items())[::-1]
+    lines = []
+
+    if len(newest_first) > profile_limit:
+        lines.append(f"**All {len(newest_first)} tables** (name: rows × columns):")
+        for name, df in newest_first:
+            cols = ", ".join(map(str, df.columns[:8]))
+            more = f", +{len(df.columns) - 8} more" if len(df.columns) > 8 else ""
+            lines.append(f"  • {name}: {len(df)} rows [{cols}{more}]")
+        lines.append(f"\n**Detailed profiles** (newest {profile_limit}):")
+
+    lines.extend(
+        _create_data_profile(df, name) for name, df in newest_first[:profile_limit]
+    )
+
+    return "\n".join(lines)
+
+
 def _parse_custom_data(custom_data: Any) -> List[Dict]:
     """
     Parse custom_data which may be list of dicts OR list of JSON strings (Gemini format).
@@ -500,11 +530,15 @@ async def _generate_chart(args: Dict, dfs: Dict) -> str:
         logger.error(f"  ❌ {error}")
         return json.dumps({"success": False, "error": error})
 
-    # Values lifted out of prose arrive as strings; coerce the plotted axes
+    # Values lifted out of prose arrive as strings, so the plotted axes are coerced —
+    # but only when every value converts. pandas 3 removed errors="ignore", and
+    # errors="coerce" alone would blank a label column like "2019-06" into NaN.
     if custom_data:
         for col in (x_col, y_col):
             if col and col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="ignore")
+                converted = pd.to_numeric(df[col], errors="coerce")
+                if converted.notna().sum() == df[col].notna().sum():
+                    df[col] = converted
 
     logger.info(f"  ✅ Data resolved: {df.shape}")
 

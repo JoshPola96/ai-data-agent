@@ -35,7 +35,11 @@ from app.utils.schemas import (
 )
 
 from app.core.config import get_settings
-from app.services.tools import get_tool_definitions, execute_tool, _create_data_profile
+from app.services.tools import (
+    get_tool_definitions,
+    execute_tool,
+    build_table_context,
+)
 from app.utils.prompts import get_system_prompt
 from app.core.dependencies import (
     vector_store,
@@ -571,6 +575,13 @@ async def chat(req: ChatRequest):
             turn += 1
             logger.info(f"🔄 Turn {turn}/{settings.AGENT_MAX_TURNS}")
 
+            # Withholding tools on the final turn forces a synthesis from what was
+            # already gathered. Otherwise the loop can spend its whole budget calling
+            # tools and return an apology instead of an answer.
+            final_turn = turn == settings.AGENT_MAX_TURNS
+            if final_turn:
+                logger.info("  ⏹ Final turn: answering without tools")
+
             # Build system prompt
             sys_prompt = get_system_prompt(
                 ctx if req.use_rag else "",
@@ -584,7 +595,7 @@ async def chat(req: ChatRequest):
             llm_resp = await llm_service.chat(
                 msgs,
                 sys_prompt,
-                tools,
+                None if final_turn else tools,
                 settings.LLM_TEMPERATURE,
                 json_mode=True,
                 model_override=req.model,

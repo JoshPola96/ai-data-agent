@@ -12,6 +12,7 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from app.core.config import get_settings
+from app.core.gpu import infer
 from app.core.vectorstore import VectorStore
 from asyncio import Lock
 
@@ -49,14 +50,14 @@ class HybridRetriever:
             logger.info(f"Model: {settings.RERANKER_MODEL}")
             logger.info(f"Device: {settings.DEVICE}")
 
-            loop = asyncio.get_event_loop()
-
             try:
-                self.reranker = await loop.run_in_executor(
-                    None,
+                self.reranker = await infer(
                     lambda: CrossEncoder(
-                        settings.RERANKER_MODEL, device=settings.DEVICE
+                        settings.RERANKER_MODEL,
+                        device=settings.DEVICE,
+                        model_kwargs={"torch_dtype": settings.MODEL_DTYPE},
                     ),
+                    "load reranker",
                 )
 
                 logger.info("✅ Reranker loaded successfully")
@@ -255,8 +256,9 @@ class HybridRetriever:
         pairs = [[query, doc["content"]] for doc in documents]
 
         # Run reranker
-        loop = asyncio.get_event_loop()
-        scores = await loop.run_in_executor(None, lambda: self.reranker.predict(pairs))
+        scores = await infer(
+            lambda: self.reranker.predict(pairs, show_progress_bar=False), "rerank"
+        )
 
         # Normalize
         scores = np.array(scores)

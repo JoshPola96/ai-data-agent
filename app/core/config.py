@@ -19,6 +19,22 @@ class Settings(BaseSettings):
     # =========================
     # Device Configuration (GPU/CPU)
     # =========================
+    # Two 2GB fp32 models oversubscribe a 4GB card, and concurrent calls then evict
+    # each other instead of computing. One at a time is dramatically faster; raise
+    # this only on a card that fits both models with headroom.
+    INFERENCE_CONCURRENCY: int = 1
+
+    # fp16 halves resident model size and is faster on any Ampere-or-later GPU.
+    # Ignored on CPU, where half precision is emulated and slower.
+    USE_FP16_ON_GPU: bool = True
+
+    @cached_property
+    def MODEL_DTYPE(self):
+        """Half precision on GPU, full precision on CPU."""
+        if self.DEVICE == "cuda" and self.USE_FP16_ON_GPU:
+            return torch.float16
+        return torch.float32
+
     @cached_property
     def DEVICE(self) -> str:
         """Auto-detect GPU availability (Cached, runs once)"""
