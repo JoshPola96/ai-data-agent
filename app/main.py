@@ -561,14 +561,8 @@ async def chat(req: ChatRequest):
             for d in docs
         ]
 
-        # DataFrame context
-        df_ctx = (
-            "\n\n".join(
-                [_create_data_profile(df, n) for n, df in list(dfs.items())[::-1][:5]]
-            )
-            if dfs
-            else "No structured data available."
-        )
+        # Every table is named so the agent never probes to discover one exists
+        df_ctx = build_table_context(dfs)
 
         # Tools
         tools = get_tool_definitions(dfs)

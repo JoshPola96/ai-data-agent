@@ -290,7 +290,14 @@ class SessionStore:
         # 2. Remove from Document Index
         await self.redis_client.hdel(key, doc_id)
 
-        # 3. Remove from Vector Store (Physical)
+        # 3. Remove the tables it produced. Without this a deleted document's data
+        # stays queryable and chartable, which is wrong for a spreadsheet and worse
+        # for a payslip.
+        for table in doc_info.get("tables", []):
+            await self.delete_dataframe(session_id, table)
+            logger.info(f"🗑️ Removed table '{table}'")
+
+        # 4. Remove from Vector Store (Physical)
         if vector_store and filename:
             try:
                 # We assume Source field in vector store = filename

@@ -394,6 +394,12 @@ with st.sidebar:
         help="Supports: PDF, DOCX, XLSX, CSV, TXT",
     )
 
+    # The guard tracks which attachments have been ingested, so it must follow what
+    # the widget currently holds: dropping a file from the uploader should allow it to
+    # be added again, while a file still attached must not be re-ingested.
+    attached = {f.name for f in uploaded_files or []}
+    st.session_state.uploaded_files &= attached
+
     if uploaded_files:
         uploaded_any = False
 
@@ -523,8 +529,10 @@ with st.sidebar:
                     if st.button("🗑️", key=f"del_{f['doc_id']}", help="Delete file"):
                         with st.spinner("Deleting..."):
                             if delete_file(f["doc_id"]):
+                                # Deliberately not discarding from uploaded_files: the
+                                # file is still attached to the uploader, and clearing
+                                # the guard would make the next rerun re-ingest it.
                                 st.success("Deleted")
-                                st.session_state.uploaded_files.discard(f["filename"])
                                 st.rerun()
                             else:
                                 st.error("Failed")

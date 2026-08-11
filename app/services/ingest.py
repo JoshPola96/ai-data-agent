@@ -83,7 +83,7 @@ class IngestionService:
                 await self.vector_store.add_documents(text_chunks)
 
             # Clean and store dataframes
-            saved_tables = 0
+            saved_tables = []
             for name, df in dataframes.items():
                 logger.info(
                     f"📊 Processing table '{name}' ({df.shape[0]}x{df.shape[1]})"
@@ -97,7 +97,7 @@ class IngestionService:
                 logger.debug(f"   Dtypes: {dict(clean_df.dtypes)}")
 
                 await self.session_store.save_dataframe(session_id, name, clean_df)
-                saved_tables += 1
+                saved_tables.append(name)
 
             # Register document in session
             await self.session_store.register_document(
@@ -106,9 +106,11 @@ class IngestionService:
                 doc_id,
                 {
                     "text_chunks": len(text_chunks),
-                    "dataframes": saved_tables,
+                    "dataframes": len(saved_tables),
+                    # Recorded so deleting the document can delete its tables too
+                    "tables": saved_tables,
                     "file_size": actual_file_size,
-                    "has_structured_data": saved_tables > 0,
+                    "has_structured_data": bool(saved_tables),
                     "file_type": filename.split(".")[-1].lower(),
                 },
             )
@@ -116,14 +118,14 @@ class IngestionService:
             logger.info("=" * 80)
             logger.info(f"✅ INGESTION COMPLETE: {filename}")
             logger.info(f"   Text chunks: {len(text_chunks)}")
-            logger.info(f"   Tables: {saved_tables}")
+            logger.info(f"   Tables: {len(saved_tables)}")
             logger.info("=" * 80)
 
             return {
                 "filename": filename,
                 "doc_id": doc_id,
                 "text_chunks": len(text_chunks),
-                "dataframes": saved_tables,
+                "dataframes": len(saved_tables),
                 "status": "success",
             }
 
