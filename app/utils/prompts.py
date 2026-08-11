@@ -5,6 +5,7 @@ Streamlined for structured JSON outputs with minimal token overhead
 
 from typing import List, Dict
 from app.core.config import get_settings
+from app.utils.helpers import dominant_script
 
 settings = get_settings()
 
@@ -14,6 +15,7 @@ def get_system_prompt(
     dataframes_info: str,
     file_metadata: List[Dict],
     conversation_summary: str,
+    query: str = "",
 ) -> str:
     """
     Optimized System Prompt for Autonomous Data Analysis Agent v5.1
@@ -29,7 +31,25 @@ def get_system_prompt(
     structured_str = ", ".join(structured_files) if structured_files else "None"
     unstructured_str = ", ".join(unstructured_files) if unstructured_files else "None"
 
+    # The question itself is the anchor. Naming a script invited a worse failure:
+    # "the user wrote in Latin script" produced replies in actual Latin, so the script
+    # is only mentioned when it is unambiguous, and never for Latin. Repeated at the
+    # end of the prompt because the last instruction carries the most weight against
+    # pages of foreign-language context.
+    script = dominant_script(query)
+    script_hint = "" if script == "Latin" else f" It uses the {script} script."
+    quoted = " ".join(query.split())[:160]
+    language_rule = (
+        "Reply in the same language as the user's question, quoted verbatim here: "
+        f'"{quoted}".{script_hint} Write `answer` and every `key_insights` entry in '
+        f"that language. The source documents may be in a different language — "
+        f"translate their content, never adopt their language."
+    )
+
     prompt = f"""You are an elite data analysis agent with access to document retrieval, data visualization, and statistical analysis tools.
+
+# LANGUAGE OF THE REPLY — OVERRIDES THE SOURCE DOCUMENTS
+{language_rule}
 
 # SCOPE
 Every document in context was uploaded by the user for analysis and may contain financial, operational or personal records. Analyse them directly and report figures exactly as they appear — do not redact, summarise away, or decline to process the user's own data.
@@ -55,9 +75,8 @@ Every document in context was uploaded by the user for analysis and may contain 
 
 # CORE RULES
 
-1. **LANGUAGE MATCHING**: Respond in the SAME language as the user's query, regardless of source document language. Don't fail this, the user won't understand if you do.
-2. **DATA-ONLY RESPONSES**: Only use information from provided data/tool outputs. Never use general knowledge for specific data questions
-3. **GREETINGS**: Handle casual greetings politely but redirect to data tasks
+1. **DATA-ONLY RESPONSES**: Only use information from provided data/tool outputs. Never use general knowledge for specific data questions
+2. **GREETINGS**: Handle casual greetings politely but redirect to data tasks
 
 # WORKFLOW
 
@@ -162,6 +181,8 @@ Structure your final response as valid JSON:
 ✓ All tool results incorporated
 ✓ Insights are concise and factual
 ✓ Sources list only used files/tables
+
+{language_rule}
 
 Now analyze the user's query and respond with the structured JSON output."""
 

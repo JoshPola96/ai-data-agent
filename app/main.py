@@ -603,6 +603,7 @@ async def chat(req: ChatRequest):
                 df_ctx,
                 file_meta,
                 conv_summary,
+                req.query,
             )
 
             # Call LLM
