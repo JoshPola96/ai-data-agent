@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 
 from app.core.config import get_settings
+from app.services import diagram
 from app.services.chart import ChartService
 
 settings = get_settings()
@@ -136,6 +137,10 @@ def _parse_custom_data(custom_data: Any) -> List[Dict]:
     return custom_data
 
 
+# Keys that select the data, not the chart; everything else is chart vocabulary
+_DATA_SOURCE_KEYS = {"table_name", "custom_data", "charts"}
+
+
 def _resolve_dataframe(args: Dict, dfs: Dict) -> tuple:
     """Resolve a tool's data source to (dataframe, error); exactly one of the two is None."""
     custom_data = args.get("custom_data")
@@ -256,6 +261,29 @@ Use `top_n` for ranking questions ("top 10 products by revenue").
                             "minimum": 1,
                             "maximum": 50,
                         },
+                        "y2_column": {
+                            "type": "string",
+                            "description": (
+                                "Second measure drawn against its own right-hand axis. Use "
+                                "when two series belong together but not on one scale, e.g. "
+                                "revenue with margin percentage."
+                            ),
+                        },
+                        "reference": {
+                            "type": "string",
+                            "description": (
+                                "Draw a baseline: 'mean', 'median', or a number. Gives a "
+                                "comparison something to be measured against."
+                            ),
+                        },
+                        "resample": {
+                            "type": "string",
+                            "description": (
+                                "Bucket a date x_column before aggregating: D, W, M, Q or Y. "
+                                "Use for daily rows answering a monthly question."
+                            ),
+                            "enum": ["D", "W", "M", "Q", "Y"],
+                        },
                     },
                     "required": ["chart_type", "title"],
                 },
@@ -319,12 +347,55 @@ Prefer this over calling generate_chart repeatedly.
                                     "title": {"type": "string"},
                                     "color_column": {"type": "string"},
                                     "top_n": {"type": "integer", "minimum": 1, "maximum": 50},
+                                    "y2_column": {"type": "string"},
+                                    "reference": {"type": "string"},
+                                    "resample": {"type": "string", "enum": ["D", "W", "M", "Q", "Y"]},
                                 },
                                 "required": ["chart_type", "title"],
                             },
                         },
                     },
                     "required": ["charts"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_diagram",
+                "description": f"""
+Draw a diagram from Mermaid source: flowcharts, sequence diagrams, state machines,
+entity relationships, timelines.
+
+Use this whenever a document describes a process, an API exchange, a state machine or
+a hierarchy — a flow is far clearer drawn than narrated. Read the document first with
+search_knowledge_base, then express what it describes.
+
+The first line must declare the type: {", ".join(diagram.SUPPORTED_TYPES)}.
+
+Write labels plainly; punctuation is quoted for you. If the source is rejected, the
+error names the line so you can correct it and call again.
+
+**Example:**
+flowchart TD
+    A[Agent] -->|phone number| B[Backend checks registry]
+    B --> C{{Known?}}
+    C -->|yes| D[Send login link]
+    C -->|no| E[Send signup link]
+""",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mermaid": {
+                            "type": "string",
+                            "description": "Complete Mermaid source, starting with the diagram type",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Short caption shown above the diagram",
+                        },
+                    },
+                    "required": ["mermaid", "title"],
                 },
             },
         },
@@ -491,6 +562,10 @@ async def execute_tool(
             result = await _generate_chart(args, dfs)
         elif name == "generate_dashboard":
             result = await _generate_dashboard(args, dfs)
+        elif name == "generate_diagram":
+            result = json.dumps(
+                diagram.build(args.get("mermaid", ""), args.get("title", "Diagram"))
+            )
         elif name == "calculate_statistics":
             result = await _calculate_statistics(args, dfs)
         elif name == "query_data":
@@ -542,16 +617,10 @@ async def _generate_chart(args: Dict, dfs: Dict) -> str:
 
     logger.info(f"  ✅ Data resolved: {df.shape}")
 
-    # Generate chart
+    # The chart service speaks the same vocabulary as the tool schema, so options
+    # pass straight through — a new one needs no plumbing here
     result = ChartService.generate_chart(
-        df=df,
-        chart_type=chart_type,
-        x_column=x_col,
-        y_column=y_col,
-        aggregation=args.get("aggregation", "none"),
-        title=args.get("title", "Chart"),
-        color_column=args.get("color_column"),
-        top_n=args.get("top_n"),
+        df=df, **{k: v for k, v in args.items() if k not in _DATA_SOURCE_KEYS}
     )
 
     # Convert numpy types for JSON serialization

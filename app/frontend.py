@@ -6,12 +6,14 @@ All endpoints integrated, enhanced chart rendering, production-ready
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import uuid
 import os
 import plotly.graph_objects as go
 import pandas as pd
 import json
+from html import escape
 
 # Configuration
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
@@ -269,27 +271,54 @@ def render_chart(chart_data, slot=""):
         st.code(json.dumps(chart_data, indent=2))
 
 
-def render_visualization(viz, slot=""):
-    """Render a single visualization (chart or table)"""
+def render_diagram(mermaid, slot=""):
+    """
+    Render Mermaid client-side; Streamlit has no diagram widget.
 
-    if viz.get("type") == "chart":
+    Height is estimated from line count because an iframe cannot size itself to
+    its content, and a clipped flowchart is worse than a slightly tall one.
+    """
+    height = min(1200, 200 + 32 * len(mermaid.splitlines()))
+
+    components.html(
+        f"""
+        <div class="mermaid" style="font-family:Arial,sans-serif">{escape(mermaid)}</div>
+        <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+        <script>
+          mermaid.initialize({{ startOnLoad: true, theme: "neutral" }});
+        </script>
+        """,
+        height=height,
+        scrolling=True,
+    )
+
+    with st.expander("Diagram source", expanded=False):
+        st.code(mermaid, language="mermaid")
+
+
+def render_visualization(viz, slot=""):
+    """Render one visualization: chart, diagram, table or prose."""
+    kind = viz.get("type")
+
+    if kind == "chart":
         if viz.get("chart_data"):
             render_chart(viz["chart_data"], slot)
 
-        if viz.get("caption"):
-            st.caption(viz["caption"])
+    elif kind == "diagram":
+        if viz.get("mermaid"):
+            render_diagram(viz["mermaid"], slot)
 
-    elif viz.get("type") == "table":
+    elif kind == "table":
         if viz.get("data"):
-            df = pd.DataFrame(viz["data"])
-            st.dataframe(df, use_container_width=True)
+            # st.dataframe brings sorting, search and CSV download for free
+            st.dataframe(pd.DataFrame(viz["data"]), use_container_width=True)
 
-        if viz.get("caption"):
-            st.caption(viz["caption"])
-
-    elif viz.get("type") == "text":
+    elif kind == "text":
         if viz.get("content"):
             st.markdown(viz["content"])
+
+    if viz.get("caption") and kind != "text":
+        st.caption(viz["caption"])
 
 
 def render_message(msg):

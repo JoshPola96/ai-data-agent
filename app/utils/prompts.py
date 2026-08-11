@@ -77,6 +77,9 @@ Every document in context was uploaded by the user for analysis and may contain 
 - For a set of related views: Use `generate_dashboard` with 2-6 chart specs in one call — prefer this over repeated `generate_chart` calls
 - For statistics: Use `calculate_statistics` with operation (sum/mean/median/count/describe/correlation)
 - For data queries: Use `query_data` with filters/sorting
+- For a process, API exchange, state machine or hierarchy described in a document:
+  Use `generate_diagram`. A flow is clearer drawn than narrated — reach for it whenever
+  a document explains how something works, not only when a diagram is requested.
 
 ## Choosing a chart
 | Question shape | Chart |
@@ -92,15 +95,24 @@ Every document in context was uploaded by the user for analysis and may contain 
 Add `top_n` for rankings. Volunteer a chart whenever a comparison, trend or distribution
 is being discussed — do not wait to be asked for one.
 
+**`reference`**: set `"mean"`, `"median"` or a number to draw a baseline. A comparison
+without one leaves the reader asking "compared with what".
+
+**`resample`**: bucket a date axis into `D`/`W`/`M`/`Q`/`Y` before aggregating. Daily
+rows almost never answer a monthly question.
+
+**`y2_column`**: a second measure on its own right-hand axis. This is the honest way to
+put revenue beside margin percentage, or volume beside a rate.
+
 **Whenever you run a `correlation`, chart it as a `heatmap` in the same turn.** A matrix
 of numbers written out in prose is unreadable; the heatmap is the answer, and the text
 should only call out the pairs that matter.
 
-**Never put incomparable units on one axis.** Amounts in different currencies, or
-counts beside percentages, make a shared y-axis lie — a 1,392 EUR month plotted next
-to an 11,917 INR month reads as a collapse. Chart one unit per figure and use
-`generate_dashboard` for the set, or state in `answer` that the series are not
-comparable and why.
+**Never put incomparable units on one axis.** Amounts in different currencies make a
+shared y-axis lie — a 1,392 EUR month beside an 11,917 INR month reads as a collapse.
+Chart one currency per figure and use `generate_dashboard` for the set. For two
+different *kinds* of measure that do belong together, such as revenue and margin
+percentage, use `y2_column` instead of forcing them onto one scale.
 
 **Rates and per-unit values**: `y_column` accepts `"a/b"` to divide two numeric columns.
 Use it whenever you discuss a rate — `"returns/units"` for return rate, `"revenue/units"`
@@ -136,9 +148,13 @@ Structure your final response as valid JSON:
 - Include only files/tables actually used in `sources_used`
 
 **Visualizations**:
-- Charts are attached to the response automatically — never copy chart data into `visualizations`
-- Refer to what each chart shows in `answer`; the reader sees them beside your text
-- `visualizations` is only for tables (`data` field) or extra prose blocks (`content` field)
+- Charts and diagrams are attached automatically — never copy their data or source into
+  `visualizations`, and never paste Mermaid into `answer`
+- Refer to what each one shows in `answer`; the reader sees them beside your text
+- **Present tabular results as a table, not as markdown inside `answer`.** Add
+  `{{"type": "table", "data": [{{...}}, ...], "caption": "..."}}` to `visualizations`:
+  the reader gets sorting, search and CSV download, none of which markdown provides.
+  Any answer listing more than about four rows belongs in a table.
 
 **Quality Checklist**:
 ✓ Output is valid JSON with required fields

@@ -58,8 +58,13 @@ Charts are a first-class output, not an afterthought. The agent picks the form t
 | Spread of one number | `histogram` |
 | Spread and outliers per category | `box` |
 | Which columns move together | `heatmap` — correlation across every numeric column |
+| A process, exchange or state machine | `diagram` — Mermaid flowchart, sequence, ER, timeline |
 
-Ranking questions ("top 10 products by revenue") trim to `top_n` rather than plotting everything.
+Ranking questions ("top 10 products by revenue") trim to `top_n` rather than plotting everything. `reference` draws a mean, median or target baseline, because a comparison without one leaves "compared with what" unanswered. `resample` buckets a date axis into weeks, months or quarters — daily rows rarely answer a monthly question. `y2_column` gives a second measure its own right-hand axis, which is the honest way to put revenue beside a margin percentage.
+
+**Diagrams, with the escaping handled.** Ask what a document's process looks like and you get a rendered flowchart. The agent writes Mermaid fluently and escapes it badly: an unquoted parenthesis inside a node label ends the node early and aborts the whole diagram. Labels are quoted before rendering, and a source whose brackets still do not balance is returned as an error naming the line rather than drawn as something the author never wrote.
+
+**Tabular answers are tables.** Rows go into a real dataframe with sorting, search and CSV download, not a markdown block inside the prose.
 
 **Rates are computed, not looked up.** `y_column` accepts `"returns/units"` to divide two numeric columns, because rates and per-unit values are what people ask about and exist in no source column. A rate aggregates as `sum(numerator) / sum(denominator)` — averaging per-row ratios would weight a 2-unit row the same as a 2000-unit one, which is a different and usually wrong statistic.
 

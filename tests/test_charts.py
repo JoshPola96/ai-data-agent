@@ -5,7 +5,7 @@ import unittest
 
 import pandas as pd
 
-from app.main import capture_charts
+from app.main import capture_visuals
 from app.services.chart import ChartService
 from app.services.tools import execute_tool, _resolve_dataframe
 
@@ -259,7 +259,7 @@ class CaptureChartsTest(unittest.TestCase):
 
     def test_charts_are_diverted_into_the_sink(self):
         sink = []
-        capture_charts(self.payload(3), sink)
+        capture_visuals(self.payload(3), sink)
         self.assertEqual(len(sink), 3)
         self.assertTrue(all(v["type"] == "chart" for v in sink))
         self.assertTrue(all(v["chart_data"]["chart_json"] for v in sink))
@@ -267,7 +267,7 @@ class CaptureChartsTest(unittest.TestCase):
     def test_receipt_excludes_the_figure_payload(self):
         sink = []
         raw = self.payload(3)
-        receipt = capture_charts(raw, sink)
+        receipt = capture_visuals(raw, sink)
         self.assertNotIn("chart_html", receipt)
         self.assertNotIn("<html>", receipt)
         self.assertLess(len(receipt), len(raw) / 10, "receipt must be far smaller than the payload")
@@ -277,19 +277,19 @@ class CaptureChartsTest(unittest.TestCase):
         single = json.dumps(
             {"success": True, "chart_json": {"data": [], "layout": {"title": {"text": "Solo"}}}, "summary": "s"}
         )
-        capture_charts(single, sink)
+        capture_visuals(single, sink)
         self.assertEqual(len(sink), 1)
         self.assertEqual(sink[0]["caption"], "Solo")
 
     def test_failed_tool_output_captures_nothing(self):
         sink = []
-        receipt = capture_charts(json.dumps({"success": False, "error": "bad column"}), sink)
+        receipt = capture_visuals(json.dumps({"success": False, "error": "bad column"}), sink)
         self.assertEqual(sink, [])
         self.assertIn("bad column", receipt)
 
     def test_non_json_output_does_not_raise(self):
         sink = []
-        self.assertIsInstance(capture_charts("not json at all", sink), str)
+        self.assertIsInstance(capture_visuals("not json at all", sink), str)
         self.assertEqual(sink, [])
 
 

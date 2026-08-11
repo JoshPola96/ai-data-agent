@@ -48,10 +48,13 @@ RUN python app/preload.py
 # Final app copy
 COPY --chown=appuser:appuser app/ ./app/
 
-# A named volume inherits ownership from the image path it is seeded from. Creating
-# this as appuser is what makes the mounted volume writable by the non-root runtime.
-# Kept after the model layer so app changes never invalidate the 4GB download.
-RUN mkdir -p /app/data/index
+# A named volume inherits ownership from the image path it is seeded from, so this
+# directory must exist and belong to appuser or the mounted volume arrives root-owned
+# and unwritable. /app itself is root-owned, hence the brief elevation. Kept after the
+# model layer so application changes never invalidate the 4GB download.
+USER root
+RUN mkdir -p /app/data/index && chown -R appuser:appuser /app/data
+USER appuser
 
 # =========================
 # Targets

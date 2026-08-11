@@ -228,16 +228,18 @@ async def _empty_list():
     return []
 
 
-CHART_TOOLS = {"generate_chart", "generate_dashboard"}
+# Tools whose output is rendered rather than reasoned over
+VISUAL_TOOLS = {"generate_chart", "generate_dashboard", "generate_diagram"}
 
 
-def capture_charts(raw: str, sink: List[Dict]) -> str:
+def capture_visuals(raw: str, sink: List[Dict]) -> str:
     """
-    Divert chart payloads into the response and return a compact receipt.
+    Divert renderable payloads into the response and return a compact receipt.
 
     Plotly figures run to kilobytes. Feeding them back as tool results would burn
     the context window and force the model to copy them verbatim into its answer,
-    which it does unreliably. The figures travel out-of-band instead.
+    which it does unreliably. Diagrams are smaller but no more reliable to copy.
+    Both travel out-of-band; the model gets titles and summaries only.
     """
     try:
         payload = json.loads(raw)
@@ -246,6 +248,25 @@ def capture_charts(raw: str, sink: List[Dict]) -> str:
 
     if not payload.get("success"):
         return json.dumps({"success": False, "error": payload.get("error")})
+
+    # A diagram is one visual with source rather than a figure
+    if payload.get("mermaid"):
+        title = payload.get("title") or f"Diagram {len(sink) + 1}"
+        sink.append(
+            {
+                "type": "diagram",
+                "mermaid": payload["mermaid"],
+                "caption": title,
+            }
+        )
+        logger.info(f"  📐 Captured diagram '{title}' out-of-band")
+        return json.dumps(
+            {
+                "success": True,
+                "rendered": [{"title": title, "summary": payload.get("summary")}],
+                "note": "This diagram is already attached to the response. Describe what it shows in 'answer'; do not repeat the source.",
+            }
+        )
 
     # generate_dashboard returns a list; generate_chart is the single-figure case
     charts = payload.get("charts") or [payload]
@@ -568,7 +589,7 @@ async def chat(req: ChatRequest):
         ctx = ""
         srcs = []
         agent_trace = []
-        produced_charts = []
+        produced_visuals = []
 
         # Agentic reasoning loop
         while turn < settings.AGENT_MAX_TURNS:
@@ -671,8 +692,8 @@ async def chat(req: ChatRequest):
                     if isinstance(result, Exception):
                         formatted_result = f"Error: {str(result)}"
                         logger.error(f"  ❌ Parallel error in {info['name']}: {result}")
-                    elif info["name"] in CHART_TOOLS:
-                        formatted_result = capture_charts(result, produced_charts)
+                    elif info["name"] in VISUAL_TOOLS:
+                        formatted_result = capture_visuals(result, produced_visuals)
                     elif info["name"] == "search_knowledge_base" and isinstance(
                         result, list
                     ):
@@ -725,16 +746,17 @@ async def chat(req: ChatRequest):
 
         logger.info(f"🏁 Agent loop completed: {turn} turns")
 
-        # Charts actually rendered by tools win over anything the model echoed back;
+        # Visuals actually produced by tools win over anything the model echoed back;
         # tables and prose blocks it composed are kept alongside them
-        if produced_charts:
+        if produced_visuals:
+            rendered = {"chart", "diagram"}
             composed = [
                 v
                 for v in final_meta.get("visualizations", [])
-                if v.get("type") != "chart"
+                if v.get("type") not in rendered
             ]
-            final_meta["visualizations"] = produced_charts + composed
-            logger.info(f"🎨 Attached {len(produced_charts)} chart(s) to response")
+            final_meta["visualizations"] = produced_visuals + composed
+            logger.info(f"🎨 Attached {len(produced_visuals)} visual(s) to response")
 
         # Save to history
         await session_store.add_chat_turn(sid, req.query, final_text or "No response.")

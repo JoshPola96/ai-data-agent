@@ -15,7 +15,9 @@ _limits = get_settings()
 class Visualization(BaseModel):
     """Single visualization element"""
 
-    type: str = Field(..., description="Type: 'chart', 'table', or 'text'")
+    type: str = Field(
+        ..., description="Type: 'chart', 'diagram', 'table', or 'text'"
+    )
     chart_data: Optional[Dict[str, Any]] = Field(
         None,
         description="Complete tool output from generate_chart. Include chart_json and summary.",
@@ -25,6 +27,9 @@ class Visualization(BaseModel):
     )
     content: Optional[str] = Field(
         None, description="Text content for text-type visualizations"
+    )
+    mermaid: Optional[str] = Field(
+        None, description="Mermaid source for diagram-type visualizations"
     )
     caption: str = Field(
         ..., description="Brief explanation of what this visualization shows"

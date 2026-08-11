@@ -7,6 +7,7 @@ Supports multiple charts, responsive sizing, and rich metadata
 
 import logging
 import warnings
+from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -18,6 +19,34 @@ import json
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*Parsing dates.*dayfirst.*")
 warnings.filterwarnings("ignore", message=".*Could not infer format.*")
+
+
+@dataclass
+class ChartSpec:
+    """
+    One chart request with every column already resolved against the dataframe.
+
+    Resolution happens once, up front, so each stage of the pipeline sees the same
+    names. Threading a dozen positional arguments through preparation, plotting and
+    annotation is how those stages drift out of agreement.
+    """
+
+    chart_type: str
+    title: str = "Chart"
+    x: Optional[str] = None
+    y: Optional[str] = None
+    y2: Optional[str] = None
+    color: Optional[str] = None
+    aggregation: str = "none"
+    top_n: Optional[int] = None
+    resample: Optional[str] = None
+    reference: Optional[str] = None
+    ratio: Optional[Dict[str, str]] = None
+
+    @property
+    def value_columns(self) -> List[str]:
+        """Columns carrying measurements, in axis order."""
+        return [c for c in (self.y, self.y2) if c]
 
 
 class ChartService:
@@ -100,6 +129,29 @@ class ChartService:
         return {"name": name, "num": num, "den": den}
 
     @staticmethod
+    def resolve(df: pd.DataFrame, **request) -> ChartSpec:
+        """Map a tool request onto columns that exist, deriving any ratio first."""
+        y_column = request.get("y_column")
+        ratio = ChartService.resolve_ratio(df, y_column) if y_column else None
+
+        def col(name):
+            return ChartService._fuzzy_col_match(df, name) if name else None
+
+        return ChartSpec(
+            chart_type=request.get("chart_type", "bar"),
+            title=request.get("title", "Chart"),
+            x=col(request.get("x_column")),
+            y=ratio["name"] if ratio else col(y_column),
+            y2=col(request.get("y2_column")),
+            color=col(request.get("color_column")),
+            aggregation=request.get("aggregation", "none"),
+            top_n=request.get("top_n"),
+            resample=request.get("resample"),
+            reference=request.get("reference"),
+            ratio=ratio,
+        )
+
+    @staticmethod
     def _clean_and_sort_data(df: pd.DataFrame, x_col: str) -> pd.DataFrame:
         """Clean and sort data intelligently"""
         plot_df = df.copy()
@@ -120,53 +172,64 @@ class ChartService:
         return plot_df
 
     @staticmethod
-    def _prepare_data(
-        df: pd.DataFrame,
-        chart_type: str,
-        x_col: str,
-        y_col: Optional[str],
-        aggregation: str,
-        top_n: Optional[int] = None,
-        color_col: Optional[str] = None,
-        ratio: Optional[Dict[str, str]] = None,
-    ) -> pd.DataFrame:
-        """Prepare data with cleaning, aggregation and optional top-N trimming"""
+    def _prepare_data(df: pd.DataFrame, spec: ChartSpec) -> pd.DataFrame:
+        """Clean, optionally resample the time axis, aggregate, then trim to a ranking."""
+        x, y = spec.x, spec.y
 
         # Categorical charts need string x-axis
-        if chart_type in ["bar", "pie"]:
-            df[x_col] = df[x_col].astype(str).fillna("Unknown")
+        if spec.chart_type in ("bar", "pie") and not spec.resample:
+            df[x] = df[x].astype(str).fillna("Unknown")
 
-        # Numeric columns
-        if y_col and y_col != "count":
-            df[y_col] = pd.to_numeric(df[y_col], errors="coerce")
-            df = df.dropna(subset=[y_col])
+        for col in spec.value_columns:
+            if col != "count" and col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if y and y != "count" and y in df.columns:
+            df = df.dropna(subset=[y])
 
-        # Aggregation. The colour column has to join the grouping keys, or the reset
-        # index drops it and the plot then fails on a column that no longer exists —
-        # which is every "trend by quarter, split by region" request.
-        if aggregation != "none":
-            keys = [x_col]
-            if color_col and color_col in df.columns and color_col != x_col:
-                keys.append(color_col)
+        # Daily rows rarely answer a monthly question. Bucketing the axis before
+        # aggregation is what turns transaction-level data into a readable trend.
+        if spec.resample and x:
+            dates = pd.to_datetime(df[x], errors="coerce")
+            if dates.notna().mean() > 0.7:
+                df = df.assign(
+                    **{x: dates.dt.to_period(spec.resample).dt.to_timestamp()}
+                ).dropna(subset=[x])
+                logger.info(f"  🗓 Resampled {x} to '{spec.resample}' buckets")
+            else:
+                logger.warning(f"  ⚠️ '{x}' is not a date column, resample skipped")
 
-            if ratio and y_col == ratio["name"]:
+        if spec.aggregation != "none":
+            keys = [x]
+            if spec.color and spec.color in df.columns and spec.color != x:
+                keys.append(spec.color)
+
+            if spec.ratio and y == spec.ratio["name"]:
                 # A rate aggregates as sum(numerator)/sum(denominator). Averaging the
-                # per-row ratios instead would weight a 2-unit row like a 2000-unit one.
-                df = df.groupby(keys, sort=False)[[ratio["num"], ratio["den"]]].sum().reset_index()
-                df[y_col] = df[ratio["num"]] / df[ratio["den"]].replace(0, np.nan)
-                logger.info(f"  ➗ Aggregated rate: sum({ratio['num']})/sum({ratio['den']}) by {keys}")
-            elif aggregation == "count":
+                # per-row ratios would weight a 2-unit row like a 2000-unit one.
+                pair = [spec.ratio["num"], spec.ratio["den"]]
+                df = df.groupby(keys, sort=False)[pair].sum().reset_index()
+                df[y] = df[spec.ratio["num"]] / df[spec.ratio["den"]].replace(0, np.nan)
+                logger.info(f"  ➗ Aggregated rate by {keys}")
+            elif spec.aggregation == "count":
                 df = df.groupby(keys, sort=False).size().reset_index(name="count")
-                y_col = "count"
+                spec.y = y = "count"
                 logger.info(f"  📊 Aggregated: count by {keys}")
-            elif y_col:
-                df = df.groupby(keys, sort=False)[y_col].agg(aggregation).reset_index()
-                logger.info(f"  📊 Aggregated: {aggregation}({y_col}) by {keys}")
+            else:
+                measures = [c for c in spec.value_columns if c in df.columns]
+                if measures:
+                    df = (
+                        df.groupby(keys, sort=False)[measures]
+                        .agg(spec.aggregation)
+                        .reset_index()
+                    )
+                    logger.info(
+                        f"  📊 Aggregated: {spec.aggregation}({measures}) by {keys}"
+                    )
 
         # "Top 10 products by revenue" is a ranking, not a full plot
-        if top_n and y_col and y_col in df.columns:
-            df = df.nlargest(int(top_n), y_col)
-            logger.info(f"  🔝 Trimmed to top {top_n} by {y_col}")
+        if spec.top_n and y and y in df.columns:
+            df = df.nlargest(int(spec.top_n), y)
+            logger.info(f"  🔝 Trimmed to top {spec.top_n} by {y}")
 
         return df
 
@@ -229,86 +292,45 @@ class ChartService:
         return ".4g"
 
     @staticmethod
-    def _create_plotly_figure(
-        df: pd.DataFrame,
-        chart_type: str,
-        x_col: str,
-        y_col: Optional[str],
-        title: str,
-        color_column: Optional[str] = None,
-    ) -> go.Figure:
-        """Create Plotly figure based on chart type"""
+    def _create_plotly_figure(df: pd.DataFrame, spec: ChartSpec) -> go.Figure:
+        """Create the Plotly figure for a resolved spec."""
+        x, y, color, title = spec.x, spec.y, spec.color, spec.title
+        kind = spec.chart_type
 
-        logger.info(f"  🎨 Creating {chart_type} chart: {title}")
-        value_fmt = ChartService._value_format(df, y_col)
+        logger.info(f"  🎨 Creating {kind} chart: {title}")
+        value_fmt = ChartService._value_format(df, y)
 
-        if chart_type == "bar":
-            fig = px.bar(
-                df,
-                x=x_col,
-                y=y_col,
-                title=title,
-                color=color_column,
-                text_auto=value_fmt,
-            )
+        if kind == "bar":
+            fig = px.bar(df, x=x, y=y, title=title, color=color, text_auto=value_fmt)
             fig.update_yaxes(tickformat=value_fmt)
 
-        elif chart_type == "line":
-            fig = px.line(
-                df,
-                x=x_col,
-                y=y_col,
-                title=title,
-                color=color_column,
-                markers=True,  # Show data points
-            )
+        elif kind == "line":
+            fig = px.line(df, x=x, y=y, title=title, color=color, markers=True)
 
-        elif chart_type == "pie":
-            # Limit to top 10 for readability
-            plot_df = df.head(10)
-            fig = px.pie(
-                plot_df,
-                names=x_col,
-                values=y_col,
-                title=title,
-                hole=0.3,  # Donut chart for better aesthetics
-            )
+        elif kind == "pie":
+            fig = px.pie(df.head(10), names=x, values=y, title=title, hole=0.3)
 
-        elif chart_type == "scatter":
+        elif kind == "scatter":
             fig = px.scatter(
                 df,
-                x=x_col,
-                y=y_col,
+                x=x,
+                y=y,
                 title=title,
-                color=color_column,
-                size=y_col if y_col else None,  # Size by value
-                hover_data=df.columns.tolist(),  # Show all data on hover
+                color=color,
+                size=y if y else None,
+                hover_data=df.columns.tolist(),
             )
 
-        elif chart_type == "histogram":
-            fig = px.histogram(
-                df,
-                x=x_col,
-                title=title,
-                color=color_column,
-                marginal="box",  # Add box plot on top
-            )
+        elif kind == "histogram":
+            fig = px.histogram(df, x=x, title=title, color=color, marginal="box")
 
-        elif chart_type == "box":
-            fig = px.box(
-                df,
-                x=x_col,
-                y=y_col,
-                title=title,
-                color=color_column,
-                points="outliers",  # Spread plus the values that break it
-            )
+        elif kind == "box":
+            fig = px.box(df, x=x, y=y, title=title, color=color, points="outliers")
 
-        elif chart_type == "heatmap":
+        elif kind == "heatmap":
             # Correlation is the one statistic that is unreadable as text
-            numeric = df.select_dtypes(include=[np.number])
             fig = px.imshow(
-                numeric.corr(),
+                df.select_dtypes(include=[np.number]).corr(),
                 title=title,
                 text_auto=".2f",
                 aspect="auto",
@@ -318,13 +340,91 @@ class ChartService:
             )
 
         else:
-            # Default to bar chart
-            fig = px.bar(df, x=x_col, y=y_col, title=title)
+            fig = px.bar(df, x=x, y=y, title=title)
 
         # Side-by-side reads better than stacked when a series is broken out
-        if color_column and chart_type == "bar":
+        if color and kind == "bar":
             fig.update_layout(barmode="group")
 
+        return ChartService._add_secondary_axis(fig, df, spec)
+
+    @staticmethod
+    def _add_secondary_axis(
+        fig: go.Figure, df: pd.DataFrame, spec: ChartSpec
+    ) -> go.Figure:
+        """
+        Plot a second measure against its own right-hand axis.
+
+        Revenue and margin percentage belong on one chart but not one scale: sharing
+        an axis flattens the smaller series into the baseline. A second axis is what
+        makes the comparison honest.
+        """
+        if not spec.y2 or spec.y2 not in df.columns:
+            return fig
+        if spec.chart_type not in ("bar", "line", "scatter"):
+            logger.warning(f"  ⚠️ Secondary axis ignored for {spec.chart_type}")
+            return fig
+
+        fig.add_trace(
+            go.Scatter(
+                x=df[spec.x],
+                y=df[spec.y2],
+                name=spec.y2,
+                mode="lines+markers",
+                yaxis="y2",
+                line={"dash": "dot"},
+            )
+        )
+        fig.update_layout(
+            yaxis2={
+                "title": spec.y2,
+                "overlaying": "y",
+                "side": "right",
+                "showgrid": False,
+                "tickformat": ChartService._value_format(df, spec.y2),
+            },
+            legend={"orientation": "h", "yanchor": "bottom", "y": -0.25},
+        )
+        logger.info(f"  ⇄ Secondary axis: {spec.y2}")
+        return fig
+
+    @staticmethod
+    def _add_reference(
+        fig: go.Figure, df: pd.DataFrame, spec: ChartSpec
+    ) -> go.Figure:
+        """
+        Draw a baseline so a comparison answers "compared with what".
+
+        Accepts "mean", "median" or a literal number.
+        """
+        if not spec.reference or not spec.y or spec.y not in df.columns:
+            return fig
+
+        series = pd.to_numeric(df[spec.y], errors="coerce")
+        choice = str(spec.reference).strip().lower()
+
+        if choice == "mean":
+            value, label = series.mean(), "mean"
+        elif choice == "median":
+            value, label = series.median(), "median"
+        else:
+            try:
+                value, label = float(spec.reference), "target"
+            except ValueError:
+                logger.warning(f"  ⚠️ Unusable reference '{spec.reference}'")
+                return fig
+
+        if pd.isna(value):
+            return fig
+
+        fig.add_hline(
+            y=value,
+            line_dash="dash",
+            line_color="rgba(0,0,0,0.45)",
+            annotation_text=f"{label}: {value:,.2f}",
+            annotation_position="top left",
+        )
+        logger.info(f"  📏 Reference line at {label} = {value:,.2f}")
         return fig
 
     @staticmethod
@@ -356,121 +456,65 @@ class ChartService:
         return fig
 
     @staticmethod
-    def generate_chart(
-        df: pd.DataFrame,
-        chart_type: str,
-        x_column: str,
-        y_column: Optional[str] = None,
-        aggregation: str = "none",
-        title: str = "Chart",
-        color_column: Optional[str] = None,
-        top_n: Optional[int] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
+    def generate_chart(df: pd.DataFrame, **request) -> Dict[str, Any]:
         """
-        Generate a Plotly chart with enhanced features.
+        Generate a Plotly chart.
 
-        Returns:
-            {
-                "success": bool,
-                "chart_json": dict,  # Plotly JSON for programmatic use
-                "chart_html": str,   # Standalone HTML
-                "summary": str,      # Summary statistics
-                "error": str,        # Error message if failed
-            }
+        Accepts the tool vocabulary (chart_type, x_column, y_column, y2_column,
+        color_column, aggregation, top_n, resample, reference, title) and returns:
+
+            {"success", "chart_json", "chart_html", "summary"}  or  {"success", "error"}
         """
         try:
-            logger.info("=" * 60)
-            logger.info("📊 CHART GENERATION REQUEST")
-            logger.info(f"  Type: {chart_type}")
-            logger.info(f"  X: {x_column}")
-            logger.info(f"  Y: {y_column}")
-            logger.info(f"  Aggregation: {aggregation}")
-            logger.info(f"  Title: {title}")
-            logger.info("=" * 60)
-
-            # Remove duplicate columns
             plot_df = df.copy().loc[:, ~df.columns.duplicated()]
-            logger.info(f"  📋 Input shape: {plot_df.shape}")
+            spec = ChartService.resolve(plot_df, **request)
 
-            # Match columns
-            x_col = ChartService._fuzzy_col_match(plot_df, x_column)
-            ratio = ChartService.resolve_ratio(plot_df, y_column) if y_column else None
-            y_col = (
-                ratio["name"]
-                if ratio
-                else (ChartService._fuzzy_col_match(plot_df, y_column) if y_column else None)
-            )
-            color_col = (
-                ChartService._fuzzy_col_match(plot_df, color_column)
-                if color_column
-                else None
-            )
+            logger.info("=" * 60)
+            logger.info(f"📊 CHART: {spec.chart_type} · {spec.title}")
+            logger.info(f"  x={spec.x} y={spec.y} y2={spec.y2} color={spec.color}")
+            logger.info(f"  agg={spec.aggregation} top_n={spec.top_n} resample={spec.resample}")
+            logger.info(f"  rows={len(plot_df)}")
+            logger.info("=" * 60)
 
             # A correlation heatmap spans every numeric column, so it has no x-axis
-            if chart_type == "heatmap":
+            if spec.chart_type == "heatmap":
                 if plot_df.select_dtypes(include=[np.number]).shape[1] < 2:
                     return {
                         "success": False,
                         "error": "Heatmap needs at least two numeric columns",
                     }
-            elif not x_col:
-                error_msg = (
-                    f"Column '{x_column}' not found. Available: {list(plot_df.columns)}"
-                )
-                logger.error(f"  ❌ {error_msg}")
-                return {"success": False, "error": error_msg}
+            elif not spec.x:
+                requested = request.get("x_column")
+                error = f"Column '{requested}' not found. Available: {list(plot_df.columns)}"
+                logger.error(f"  ❌ {error}")
+                return {"success": False, "error": error}
 
-            if x_col:
-                # Clean and sort
-                plot_df = ChartService._clean_and_sort_data(plot_df, x_col)
-
-                # Prepare data
-                plot_df = ChartService._prepare_data(
-                    plot_df, chart_type, x_col, y_col, aggregation, top_n, color_col, ratio
-                )
+            if spec.x:
+                plot_df = ChartService._clean_and_sort_data(plot_df, spec.x)
+                plot_df = ChartService._prepare_data(plot_df, spec)
 
             if plot_df.empty:
-                error_msg = "No data remaining after processing"
-                logger.error(f"  ❌ {error_msg}")
-                return {"success": False, "error": error_msg}
+                logger.error("  ❌ No data remaining after processing")
+                return {"success": False, "error": "No data remaining after processing"}
 
-            logger.info(f"  ✅ Processed shape: {plot_df.shape}")
+            if not spec.y and spec.chart_type not in ("histogram", "heatmap"):
+                spec.y = ChartService._auto_select_y_column(plot_df, spec.chart_type)
 
-            # Auto-select Y if needed
-            if not y_col and chart_type != "histogram":
-                y_col = ChartService._auto_select_y_column(plot_df, chart_type)
-                if aggregation == "count":
-                    y_col = "count"
+            fig = ChartService._create_plotly_figure(plot_df, spec)
+            fig = ChartService._add_reference(fig, plot_df, spec)
+            fig = ChartService._apply_layout_enhancements(fig, spec.chart_type)
 
-            # Create figure
-            fig = ChartService._create_plotly_figure(
-                plot_df, chart_type, x_col, y_col, title, color_col
-            )
+            summary = ChartService._calculate_summary_stats(plot_df, spec.y)
 
-            # Apply enhancements
-            fig = ChartService._apply_layout_enhancements(fig, chart_type)
-
-            # Calculate summary
-            summary = ChartService._calculate_summary_stats(plot_df, y_col)
-
-            # Serialize to JSON
-            chart_json_str = fig.to_json()
-            chart_json = json.loads(chart_json_str)
-
-            # Generate standalone HTML
-            chart_html = fig.to_html(
-                include_plotlyjs="cdn",
-                config=ChartService.CHART_CONFIG,
-            )
-
-            logger.info("  ✅ Chart generated successfully")
+            logger.info(f"  ✅ Chart ready ({len(plot_df)} rows plotted)")
             logger.info("=" * 60)
 
             return {
                 "success": True,
-                "chart_json": chart_json,
-                "chart_html": chart_html,
+                "chart_json": json.loads(fig.to_json()),
+                "chart_html": fig.to_html(
+                    include_plotlyjs="cdn", config=ChartService.CHART_CONFIG
+                ),
                 "summary": summary,
             }
 
