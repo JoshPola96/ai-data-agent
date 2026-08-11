@@ -5,7 +5,6 @@ Streamlined for structured JSON outputs with minimal token overhead
 
 from typing import List, Dict
 from app.core.config import get_settings
-from app.utils.helpers import dominant_script
 
 settings = get_settings()
 
@@ -31,19 +30,14 @@ def get_system_prompt(
     structured_str = ", ".join(structured_files) if structured_files else "None"
     unstructured_str = ", ".join(unstructured_files) if unstructured_files else "None"
 
-    # The question itself is the anchor. Naming a script invited a worse failure:
-    # "the user wrote in Latin script" produced replies in actual Latin, so the script
-    # is only mentioned when it is unambiguous, and never for Latin. Repeated at the
-    # end of the prompt because the last instruction carries the most weight against
-    # pages of foreign-language context.
-    script = dominant_script(query)
-    script_hint = "" if script == "Latin" else f" It uses the {script} script."
-    quoted = " ".join(query.split())[:160]
+    # The question itself is the anchor — it is already written in the language the
+    # reply needs, so no detection is required. Repeated as the prompt's last line
+    # because a stated rule at the top loses to pages of foreign-language context.
     language_rule = (
         "Reply in the same language as the user's question, quoted verbatim here: "
-        f'"{quoted}".{script_hint} Write `answer` and every `key_insights` entry in '
-        f"that language. The source documents may be in a different language — "
-        f"translate their content, never adopt their language."
+        f'"{" ".join(query.split())[:160]}". Write `answer` and every `key_insights` '
+        "entry in that language. The source documents may be in a different language — "
+        "translate their content, never adopt their language."
     )
 
     prompt = f"""You are an elite data analysis agent with access to document retrieval, data visualization, and statistical analysis tools.

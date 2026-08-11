@@ -10,53 +10,28 @@ is repeated last, where the model weights it most.
 
 import unittest
 
-from app.utils.helpers import dominant_script
 from app.utils.prompts import get_system_prompt
 
 ARABIC = "ما هي شروط التسجيل كباحث عن عمل؟"
 ENGLISH = "What are the eligibility conditions to register as a job seeker?"
 
 
-class ScriptDetectionTest(unittest.TestCase):
-    def test_english(self):
-        self.assertEqual(dominant_script(ENGLISH), "Latin")
-
-    def test_arabic(self):
-        self.assertEqual(dominant_script(ARABIC), "Arabic")
-
-    def test_cyrillic(self):
-        self.assertEqual(dominant_script("Каковы условия регистрации?"), "Cyrillic")
-
-    def test_cjk(self):
-        self.assertEqual(dominant_script("登録条件は何ですか"), "CJK")
-
-    def test_mixed_falls_to_the_majority_script(self):
-        """A stray Latin token in an Arabic question must not flip the reply."""
-        self.assertEqual(dominant_script(ARABIC + " (PDF)"), "Arabic")
-
-    def test_latin_with_a_stray_arabic_word_stays_latin(self):
-        self.assertEqual(dominant_script("What does وزارة mean in this report?"), "Latin")
-
-    def test_empty_defaults_to_latin(self):
-        self.assertEqual(dominant_script(""), "Latin")
-
-    def test_digits_and_symbols_only(self):
-        self.assertEqual(dominant_script("2 + 2 = ?"), "Latin")
-
-
 class PromptLanguageDirectiveTest(unittest.TestCase):
     def prompt(self, query, context=""):
         return get_system_prompt(context, "No tables.", [], "", query)
 
-    def test_latin_is_never_named_as_a_language(self):
+    def test_no_language_or_script_is_ever_named(self):
         """
-        Naming it produced replies in actual Latin: "Informationes de condicionibus
-        eligibilitatis...". The question itself is the anchor instead.
+        A hand-rolled detector naming the script produced replies in actual Latin:
+        "Informationes de condicionibus eligibilitatis...". The quoted question is
+        already in the target language, so nothing needs classifying.
         """
-        self.assertNotIn("Latin", self.prompt(ENGLISH))
+        prompt = self.prompt(ENGLISH)
+        for word in ("Latin", "Arabic script", "Cyrillic", "CJK"):
+            self.assertNotIn(word, prompt)
 
-    def test_a_non_latin_script_is_named_because_it_is_unambiguous(self):
-        self.assertIn("Arabic script", self.prompt(ARABIC))
+    def test_an_arabic_question_is_quoted_in_arabic(self):
+        self.assertIn(ARABIC, self.prompt(ARABIC))
 
     def test_the_question_is_quoted_back(self):
         self.assertIn("eligibility conditions", self.prompt(ENGLISH))
