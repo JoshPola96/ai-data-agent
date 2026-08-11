@@ -97,6 +97,8 @@ On an RTX 3050 Laptop (4GB VRAM), `gemini-2.5-flash`, 89-chunk corpus:
 | Three-chart dashboard | 11–13s |
 | RAG query, cross-language | 25–30s |
 | Cold start (models into VRAM) | ~45s |
+| 1 retrieval, 3 query variants | 0.83s |
+| 5 concurrent retrievals | 2.80s for all five |
 
 RAG queries dominate because they add query expansion, hybrid search over every variant, and cross-encoder reranking before the answer call. Turn off `USE_MULTI_QUERY` and `USE_RERANKING` to see the floor.
 
@@ -113,7 +115,9 @@ GPU is auto-detected; without one, everything runs on CPU. `DEVICE` in the logs 
 | `bge-m3` + `bge-reranker-v2-m3` | ~2.1GB | ~2.1GB | ~4.2GB VRAM |
 | English alternatives | ~0.5GB | ~0.5GB | ~1.0GB VRAM |
 
-On a 4GB card the multilingual pair sits right at the edge. If loading fails, set `USE_RERANKING=false` to drop the second model, or force CPU:
+Those are fp32 figures. With `USE_FP16_ON_GPU=true` (the default) the pair is ~2.7GB resident, which is what makes a 4GB card workable — and why `INFERENCE_CONCURRENCY` defaults to 1. Raising it on a card this size makes concurrent calls evict each other, turning a 0.05s reranker batch into 50-100s.
+
+If loading still fails, set `USE_RERANKING=false` to drop the second model, or force CPU:
 
 ```bash
 CUDA_VISIBLE_DEVICES= docker compose up -d --force-recreate backend
@@ -131,7 +135,7 @@ docker compose logs -f backend        # follow the agent loop
 curl localhost:8000/status            # documents, vectors, active model
 curl localhost:8000/health            # liveness
 
-docker compose exec backend python -m unittest discover -s tests -t .   # 73 offline tests
+docker compose exec backend python -m unittest discover -s tests -t .   # 163 offline tests
 docker compose exec backend python tests/e2e.py                         # end-to-end, spends API calls
 ```
 
