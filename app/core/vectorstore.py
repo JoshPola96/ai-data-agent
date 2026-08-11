@@ -32,6 +32,8 @@ class VectorStore:
         self.index: Optional[faiss.Index] = None
         self.embedder: Optional[SentenceTransformer] = None
         self.dim = settings.EMBEDDING_DIM
+        # Bumped on every mutation so derived indexes know when they are stale
+        self.version = 0
         self._lock = asyncio.Lock()
         self._initialized = False
 
@@ -59,7 +61,6 @@ class VectorStore:
                     lambda: SentenceTransformer(
                         settings.EMBEDDING_MODEL,
                         device=settings.DEVICE,
-                        cache_folder=settings.HF_HOME,
                         model_kwargs={"torch_dtype": settings.MODEL_DTYPE},
                     ),
                     "load embedder",
@@ -123,6 +124,7 @@ class VectorStore:
 
             self.documents = documents
             self.index = index
+            self.version += 1
             logger.info(f"📂 Restored {index.ntotal} vectors from {index_path}")
 
         except Exception as e:
@@ -162,6 +164,7 @@ class VectorStore:
                 await self._build_index()
                 self._persist()
                 logger.info(f"🧹 Pruned {removed} documents from expired sessions")
+                self.version += 1
 
         return removed
 
@@ -214,6 +217,8 @@ class VectorStore:
                     await self._build_index()
 
                 self._persist()
+
+            self.version += 1
 
         logger.info("=" * 60)
         return len(documents)
@@ -383,6 +388,7 @@ class VectorStore:
         async with self._lock:
             self.documents.clear()
             self.index = faiss.IndexFlatIP(self.dim)
+            self.version += 1
             self._persist()
             logger.info("🗑️ Vector store cleared")
 
@@ -401,6 +407,7 @@ class VectorStore:
                 logger.info(
                     f"🗑️ Removed {removed_count} documents for session {session_id[:8]}"
                 )
+                self.version += 1
 
         return removed_count
 
@@ -417,6 +424,7 @@ class VectorStore:
                 logger.info(
                     f"🗑️ Removed {removed_count} documents from source: {source}"
                 )
+                self.version += 1
 
         return removed_count
 

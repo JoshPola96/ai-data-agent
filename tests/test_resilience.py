@@ -16,50 +16,51 @@ class Status503(Exception):
 
 
 class ClassifyTest(unittest.TestCase):
-    def test_rate_limit_is_transient(self):
+    """
+    Retry is decided by HTTP status alone.
+
+    An earlier version matched provider message text and misread Gemini's recoverable
+    rate limit as terminal, because that message mentions billing. Prose is not an
+    interface; the status code is.
+    """
+
+    def test_rate_limit_is_retryable(self):
         self.assertTrue(_is_transient(Status429("rate limit exceeded")))
 
-    def test_overload_is_transient(self):
+    def test_overload_is_retryable(self):
         self.assertTrue(_is_transient(Status503("model is overloaded")))
 
-    def test_gemini_quota_wording_is_transient(self):
-        self.assertTrue(_is_transient(Exception("429 RESOURCE_EXHAUSTED, try again later")))
-
-    def test_gemini_high_demand_is_transient(self):
-        self.assertTrue(_is_transient(Exception("503 UNAVAILABLE: high demand")))
-
-    def test_out_of_credit_is_not_transient(self):
-        """A funding failure is also a 429, but retrying it only wastes calls."""
-        self.assertFalse(
-            _is_transient(Status429("insufficient_quota: You have no credits remaining"))
-        )
-
-    def test_billing_wording_is_not_transient(self):
-        self.assertFalse(_is_transient(Exception("credit_balance_exhausted")))
-
-    def test_gemini_rate_limit_mentioning_billing_is_still_transient(self):
+    def test_an_exhausted_account_is_retried_too(self):
         """
-        Regression: Gemini's recoverable rate-limit text names billing.
-
-        Matching a bare "billing" marked these terminal, so they failed instantly
-        instead of backing off — the opposite of the intended behaviour.
+        It will not clear, but a 429 is refused before any completion is generated,
+        so retrying costs latency rather than money.
         """
-        real = (
-            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded "
-            "your current quota, please check your plan and billing details.'}}"
+        self.assertTrue(
+            _is_transient(Status429("insufficient_quota: no credits remaining"))
         )
-        self.assertTrue(_is_transient(Status429(real)))
 
-    def test_openai_out_of_credit_wording_is_still_terminal(self):
-        real = (
-            "Error code: 429 - {'error': {'message': 'You have no credits remaining. "
-            "Add credits to continue using the API at https://platform.openai.com/"
-            "settings/organization/billing/.', 'type': 'insufficient_quota'}}"
-        )
-        self.assertFalse(_is_transient(Status429(real)))
+    def test_a_bad_request_is_not_retryable(self):
+        class Status400(Exception):
+            status_code = 400
 
-    def test_bad_request_is_not_transient(self):
-        self.assertFalse(_is_transient(Exception("400 INVALID_ARGUMENT: bad schema")))
+        self.assertFalse(_is_transient(Status400("INVALID_ARGUMENT: bad schema")))
+
+    def test_google_style_code_attribute_is_read(self):
+        class GoogleError(Exception):
+            code = 503
+
+        self.assertTrue(_is_transient(GoogleError("UNAVAILABLE")))
+
+    def test_an_exception_without_a_status_is_not_retryable(self):
+        self.assertFalse(_is_transient(ValueError("something local broke")))
+
+    def test_message_text_is_never_consulted(self):
+        """Alarming words in the message must not make a 400 retryable."""
+
+        class Status400(Exception):
+            status_code = 400
+
+        self.assertFalse(_is_transient(Status400("overloaded, try again, timeout")))
 
 
 class RetryTest(unittest.IsolatedAsyncioTestCase):
@@ -84,14 +85,7 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
             await _with_retry(call, "test")
         self.assertEqual(call.await_count, 3)
 
-    async def test_funding_failure_is_not_retried(self):
-        """The whole point: never burn extra billable calls on a dead account."""
-        call = AsyncMock(side_effect=Status429("insufficient_quota, no credits remaining"))
-        with self.assertRaises(Status429):
-            await _with_retry(call, "test")
-        self.assertEqual(call.await_count, 1)
-
-    async def test_permanent_error_is_not_retried(self):
+    async def test_an_error_without_a_status_fails_immediately(self):
         call = AsyncMock(side_effect=ValueError("400 INVALID_ARGUMENT"))
         with self.assertRaises(ValueError):
             await _with_retry(call, "test")

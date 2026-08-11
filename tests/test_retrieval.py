@@ -15,6 +15,7 @@ DOCS = [
 
 
 class FakeVectorStore:
+    version = 1
     """Returns every document as a hit so scoping, not ranking, is what's under test."""
 
     def __init__(self):
@@ -82,6 +83,24 @@ class RetrievalTest(unittest.IsolatedAsyncioTestCase):
                 "revenue", expanded_queries=["a", "b", "c", "d"]
             )
             self.assertEqual(bm25.call_count, 1)
+
+    async def test_the_index_is_reused_across_requests(self):
+        """Tokenising the corpus is the expensive part; it must not repeat per request."""
+        with patch.object(
+            retrieval_mod, "BM25Okapi", wraps=retrieval_mod.BM25Okapi
+        ) as bm25:
+            for _ in range(3):
+                await self.retriever.retrieve("revenue")
+            self.assertEqual(bm25.call_count, 1)
+
+    async def test_a_corpus_change_invalidates_the_index(self):
+        with patch.object(
+            retrieval_mod, "BM25Okapi", wraps=retrieval_mod.BM25Okapi
+        ) as bm25:
+            await self.retriever.retrieve("revenue")
+            self.retriever.vector_store.version += 1
+            await self.retriever.retrieve("revenue")
+            self.assertEqual(bm25.call_count, 2)
 
     async def test_scope_is_passed_down_to_vector_search(self):
         await self.retriever.retrieve("revenue", session_ids={"alice"})

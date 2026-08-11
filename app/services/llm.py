@@ -21,40 +21,22 @@ from app.utils.schemas import FinalResponseSchema
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# A funding failure looks like a rate limit (both are 429) but never clears on retry,
-# so it is matched first and allowed to fail straight through to the other provider.
-# Markers must be specific: Gemini's *recoverable* rate-limit text says "check your plan
-# and billing details", so a bare "billing" here would misclassify it as terminal.
-_FUNDING_MARKERS = (
-    "insufficient_quota",
-    "no credits remaining",
-    "credit_balance",
-    "billing_not_active",
-)
-_TRANSIENT_MARKERS = (
-    "resource_exhausted",
-    "unavailable",
-    "overloaded",
-    "high demand",
-    "timeout",
-    "temporarily",
-    "try again",
-)
-_TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+# Retry decided by HTTP status alone. Both providers surface the code on the exception
+# (`status_code` for OpenAI, `code` for google-genai), so no message text is inspected:
+# provider prose is marketing copy that changes without notice, and an earlier version
+# of this file misread Gemini's recoverable rate limit as terminal because the message
+# mentions billing.
+#
+# An exhausted account also returns 429 and will never clear, so it is retried too.
+# That costs latency, not money: a 429 is refused before any completion is generated,
+# so nothing is billed. Bounded retries then fail over.
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def _is_transient(exc: Exception) -> bool:
     """True when retrying the same provider has a realistic chance of succeeding."""
-    text = str(exc).lower()
-
-    if any(m in text for m in _FUNDING_MARKERS):
-        return False
-
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    if isinstance(status, int) and status in _TRANSIENT_STATUS:
-        return True
-
-    return any(m in text for m in _TRANSIENT_MARKERS)
+    return isinstance(status, int) and status in _RETRYABLE_STATUS
 
 
 async def _with_retry(call, label: str):

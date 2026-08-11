@@ -10,22 +10,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    libgomp1 \
-    libopenblas-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies using BuildKit cache
-# This keeps the pip cache persistent between builds
-COPY requirements.txt .
+# Dependencies in one layer so the compilers can be purged again. build-essential is
+# only needed to build wheels; in its own layer it would stay in the image forever.
+# curl remains for the healthcheck, libgomp and openblas are runtime deps of faiss.
+#
 # pip>=25.1 resumes interrupted downloads; the base image ships 24.0, which restarts
-# multi-hundred-MB CUDA wheels from zero on any mid-stream TLS break
+# multi-hundred-MB CUDA wheels from zero on any mid-stream TLS break.
+COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade "pip>=25.1" \
-    && pip install --retries 10 --timeout 120 --resume-retries 10 -r requirements.txt
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl libgomp1 libopenblas-dev \
+    && pip install --upgrade "pip>=25.1" \
+    && pip install --retries 10 --timeout 120 --resume-retries 10 -r requirements.txt \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create user and cache directory
 RUN useradd -m -u 1000 appuser \

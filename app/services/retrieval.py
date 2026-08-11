@@ -34,6 +34,11 @@ class HybridRetriever:
         self.reranker: CrossEncoder = None
         self._reranker_initialized = False
         self._lock = Lock()
+        # BM25 tokenises the whole corpus to build, so it is cached against the
+        # store's version rather than rebuilt for every request
+        self._bm25 = None
+        self._bm25_version = None
+        self._bm25_lock = Lock()
 
     async def _initialize_reranker(self):
         """Lazy load reranker model"""
@@ -105,34 +110,29 @@ class HybridRetriever:
             logger.warning("⚠️ No documents in vector store")
             return []
 
-        # Scope to documents this session may see, keeping positions global for fusion
-        scoped = [
-            (i, d)
-            for i, d in enumerate(all_docs)
-            if session_ids is None or d.get("session_id") in session_ids
-        ]
+        # Scope to the documents this session may see; positions stay global so BM25
+        # and the vector index agree and the cached index is shared by every session
+        allowed = (
+            None
+            if session_ids is None
+            else {
+                i
+                for i, d in enumerate(all_docs)
+                if d.get("session_id") in session_ids
+            }
+        )
 
-        if not scoped:
+        if allowed is not None and not allowed:
             logger.warning("⚠️ No documents visible to this session")
             return []
 
-        global_ids = [i for i, _ in scoped]
-        allowed = set(global_ids)
+        visible = len(all_docs) if allowed is None else len(allowed)
+        logger.info(f"Searching {visible} of {len(all_docs)} documents")
 
-        logger.info(f"Searching {len(scoped)} of {len(all_docs)} documents")
-
-        # Index once per request, not once per variant
-        bm25 = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: BM25Okapi(
-                [d.get("content", "").lower().split() for _, d in scoped]
-            ),
-        )
+        bm25 = await self._corpus_index(all_docs)
 
         # Search with all queries in parallel
-        search_tasks = [
-            self._search_single_query(q, bm25, global_ids, allowed) for q in queries
-        ]
+        search_tasks = [self._search_single_query(q, bm25, allowed) for q in queries]
         all_query_results = await asyncio.gather(*search_tasks)
 
         # Combine results
@@ -182,22 +182,50 @@ class HybridRetriever:
 
         return final_docs
 
+    async def _corpus_index(self, all_docs: List[Dict]) -> BM25Okapi:
+        """
+        BM25 over the whole corpus, rebuilt only when the corpus changes.
+
+        Building it tokenises every document, which was previously paid on every
+        request — and once per query variant before that. Keying the cache on the
+        store's version also lets all sessions share one index: scoping is applied
+        when selecting hits, not by re-indexing a subset.
+        """
+        version = self.vector_store.version
+
+        if self._bm25 is not None and self._bm25_version == version:
+            return self._bm25
+
+        async with self._bm25_lock:
+            if self._bm25 is not None and self._bm25_version == version:
+                return self._bm25
+
+            self._bm25 = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: BM25Okapi(
+                    [d.get("content", "").lower().split() for d in all_docs]
+                ),
+            )
+            self._bm25_version = version
+            logger.info(f"🔤 BM25 indexed {len(all_docs)} documents (v{version})")
+
+        return self._bm25
+
     async def _search_single_query(
-        self, query: str, bm25: BM25Okapi, global_ids: List[int], allowed: set
+        self, query: str, bm25: BM25Okapi, allowed: set = None
     ) -> List[int]:
         """Hybrid search for single query"""
         logger.debug(f"Searching: {query[:50]}...")
 
         # BM25 and FAISS in parallel
-        bm25_task = self._bm25_search(query, bm25, settings.RETRIEVAL_CANDIDATES)
+        bm25_task = self._bm25_search(
+            query, bm25, settings.RETRIEVAL_CANDIDATES, allowed
+        )
         faiss_task = self.vector_store.search(
             query, settings.RETRIEVAL_CANDIDATES, allowed=allowed
         )
 
         bm25_results, faiss_results = await asyncio.gather(bm25_task, faiss_task)
-
-        # BM25 ranks the scoped corpus; lift its positions back into global space
-        bm25_results = [(global_ids[i], score) for i, score in bm25_results]
 
         logger.debug(f"  BM25: {len(bm25_results)} results")
         logger.debug(f"  FAISS: {len(faiss_results)} results")
@@ -210,14 +238,20 @@ class HybridRetriever:
         return fused_indices
 
     async def _bm25_search(
-        self, query: str, bm25: BM25Okapi, top_k: int
+        self, query: str, bm25: BM25Okapi, top_k: int, allowed: set = None
     ) -> List[Tuple[int, float]]:
-        """BM25 lexical search against a prebuilt index"""
+        """BM25 lexical search against the cached corpus index, scoped on selection."""
 
         def _bm25_compute():
             scores = bm25.get_scores(query.lower().split())
-            top_indices = np.argsort(scores)[::-1][:top_k]
-            return [(int(i), float(scores[i])) for i in top_indices]
+            hits = []
+            for i in np.argsort(scores)[::-1]:
+                index = int(i)
+                if allowed is None or index in allowed:
+                    hits.append((index, float(scores[index])))
+                    if len(hits) >= top_k:
+                        break
+            return hits
 
         return await asyncio.get_event_loop().run_in_executor(None, _bm25_compute)
 

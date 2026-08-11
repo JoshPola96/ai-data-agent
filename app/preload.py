@@ -50,7 +50,9 @@ def load_model_smart(build, model_name, model_type="Model"):
 
 def preload():
     """Preload all models into cache"""
-    # Cache directory
+    # HF_HOME governs the cache for every library here. Naming it explicitly as
+    # sentence-transformers' cache_folder created a second root beside $HF_HOME/hub
+    # and downloaded the same 2GB of weights into both.
     hf_cache = os.environ.get("HF_HOME", "/app/.cache/huggingface")
     logger.info("=" * 80)
     logger.info("📦 SMART MODEL PRELOADING")
@@ -63,9 +65,7 @@ def preload():
         # 1. Embedding Model
         logger.info("")
         embedding_model = load_model_smart(
-            lambda **kw: SentenceTransformer(
-                EMBEDDING_MODEL, device=device, cache_folder=hf_cache, **kw
-            ),
+            lambda **kw: SentenceTransformer(EMBEDDING_MODEL, device=device, **kw),
             EMBEDDING_MODEL,
             "Embedding",
         )
