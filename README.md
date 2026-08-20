@@ -9,7 +9,7 @@
 ![Tests](https://img.shields.io/badge/tests-558%20offline-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Scope** · Personal project, built on my own time.
+> **Scope** · Personal hobby project, built on my own time. Worked on actively for now, but it is not a product, carries no support, and will stop being current the moment I stop finding it interesting.
 
 **Upload the exports you really have — a `TOTAL` row loaded as data, four spellings of one
 region, revenue duplicated in two currencies — ask in any language, and get an answer whose
