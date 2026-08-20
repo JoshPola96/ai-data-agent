@@ -21,15 +21,7 @@ from app.utils.schemas import FinalResponseSchema
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Retry decided by HTTP status alone. Both providers surface the code on the exception
-# (`status_code` for OpenAI, `code` for google-genai), so no message text is inspected:
-# provider prose is marketing copy that changes without notice, and an earlier version
-# of this file misread Gemini's recoverable rate limit as terminal because the message
-# mentions billing.
-#
-# An exhausted account also returns 429 and will never clear, so it is retried too.
-# That costs latency, not money: a 429 is refused before any completion is generated,
-# so nothing is billed. Bounded retries then fail over.
+# Retry decided by HTTP status alone. Both providers surface the code on the exception (`status_code` for OpenAI, `code` for google-genai)
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
@@ -37,6 +29,24 @@ def _is_transient(exc: Exception) -> bool:
     """True when retrying the same provider has a realistic chance of succeeding."""
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     return isinstance(status, int) and status in _RETRYABLE_STATUS
+
+
+def _provider_reason(exc: Optional[Exception]) -> str:
+    """
+    A short, honest description of why a provider refused, safe to show a user.
+
+    The provider's own message is the only place the distinction lives — an exhausted
+    key and a rate limit are both 429 — but those messages run to several lines of JSON
+    with URLs, so only the leading sentence is surfaced. None of this drives control
+    flow; retry and failover decide on status alone.
+    """
+    if exc is None:
+        return "no response"
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    text = " ".join(str(exc).split())
+    if len(text) > 140:
+        text = text[:137] + "..."
+    return f"HTTP {status}: {text}" if isinstance(status, int) else text or type(exc).__name__
 
 
 async def _with_retry(call, label: str):
@@ -56,8 +66,7 @@ async def _with_retry(call, label: str):
             await asyncio.sleep(wait)
 
 
-# Non-strict json_schema: strict mode requires fully-specified object schemas,
-# which the free-form `custom_data` tool argument cannot satisfy.
+# Non-strict json_schema: strict mode requires fully-specified object schemas, which the free-form `custom_data` tool argument cannot satisfy.
 RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -67,6 +76,19 @@ RESPONSE_FORMAT = {
 }
 
 
+# Request parameters a model may refuse. Reasoning models reject any temperature but the
+# default; older ones reject json_schema response formats or the newer token limit. Which
+# is which changes with every release, so the set is discovered per model at runtime rather
+# than maintained as a compatibility matrix that is wrong the week after it is written.
+_DROPPABLE = ("temperature", "response_format", "max_completion_tokens", "tool_choice")
+
+# Query expansion is the one call that wants variety: its whole job is to phrase the same
+# question several ways so lexical search has more than one shot at the corpus. The agent
+# loop runs at LLM_TEMPERATURE, which defaults to zero, because there repeatability is the
+# point — identical questions should not get differently reasoned answers.
+_EXPANSION_TEMPERATURE = 0.3
+
+
 class LLMService:
     def __init__(self):
         self.openai_client: Optional[AsyncOpenAI] = None
@@ -74,6 +96,37 @@ class LLMService:
         self.model = settings.DEFAULT_MODEL
         self.fallback_model = settings.FALLBACK_MODEL
         self._initialized = False
+        # {model: {parameter it rejected}}, learned from the provider's own complaint
+        self._unsupported: Dict[str, set] = {}
+
+    async def _openai_create(self, kwargs: Dict[str, Any]):
+        """
+        Call OpenAI, dropping any parameter this model says it will not accept.
+
+        The provider names the offending parameter in the 400, and it is the only thing
+        that knows. Reading it is safe in a way that reading provider prose generally is
+        not: the worst case is that nothing matches, the retry is skipped, and the call
+        fails over exactly as it would have. Nothing silently changes meaning.
+        """
+        model = kwargs["model"]
+        for parameter in self._unsupported.get(model, ()):
+            kwargs.pop(parameter, None)
+
+        try:
+            return await self.openai_client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if getattr(e, "status_code", None) != 400:
+                raise
+            complaint = str(e).lower()
+            offending = next(
+                (p for p in _DROPPABLE if p in kwargs and f"'{p}'" in complaint), None
+            )
+            if not offending:
+                raise
+            logger.warning(f"⚠️ {model} rejects '{offending}', retrying without it")
+            self._unsupported.setdefault(model, set()).add(offending)
+            kwargs.pop(offending)
+            return await self.openai_client.chat.completions.create(**kwargs)
 
     async def initialize(self):
         """Initialize API clients"""
@@ -101,7 +154,9 @@ class LLMService:
         messages: List[Dict[str, Any]],
         system_prompt: Optional[str] = None,
         tools: Optional[List[Dict]] = None,
-        temperature: float = 0.2,
+        # Defaulted from settings rather than a literal, so a caller that omits it cannot
+        # silently run at a different temperature than the one configured.
+        temperature: float = settings.LLM_TEMPERATURE,
         json_mode: bool = False,
         model_override: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -117,7 +172,7 @@ class LLMService:
 
         # Route based on model
         if "gemini" in active_model.lower():
-            return await self._chat_gemini(
+            result = await self._chat_gemini(
                 messages,
                 system_prompt,
                 tools,
@@ -126,7 +181,7 @@ class LLMService:
                 active_model,
             )
         else:
-            return await self._chat_openai(
+            result = await self._chat_openai(
                 messages,
                 system_prompt,
                 tools,
@@ -134,6 +189,10 @@ class LLMService:
                 json_mode,
                 active_model,
             )
+
+        # Report which model actually answered
+        result.setdefault("model", active_model)
+        return result
 
     async def generate_query_variants(self, query: str, n: int) -> List[str]:
         """Expand a query into n total phrasings to widen retrieval recall."""
@@ -179,7 +238,7 @@ class LLMService:
                 model=self.model.split(":")[-1],
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.3,
+                    temperature=_EXPANSION_TEMPERATURE,
                     response_mime_type="application/json",
                 ),
             )
@@ -209,7 +268,8 @@ class LLMService:
         """
         if not self.openai_client:
             return await self._try_fallback(
-                messages, system_prompt, tools, temperature, json_mode, model_name
+                messages, system_prompt, tools, temperature, json_mode, model_name,
+                RuntimeError("no OPENAI_API_KEY configured"),
             )
 
         # Format messages
@@ -240,15 +300,13 @@ class LLMService:
 
             formatted_msgs.append(msg_to_add)
 
-        # Tools and the response schema travel together, so the model either calls a tool
-        # or emits schema-shaped JSON in one round-trip. Sent via create() rather than
-        # parse(): the parse() helper demands strict tools, and `custom_data` accepts
-        # free-form objects that OpenAI's strict subset cannot express.
+        # Tools and the response schema travel together, so the model either calls a tool or emits schema-shaped JSON in one round-trip.
         kwargs = {
             "model": model_name,
             "messages": formatted_msgs,
             "temperature": temperature,
             "response_format": RESPONSE_FORMAT,
+            "max_completion_tokens": settings.LLM_MAX_TOKENS,
         }
         if tools:
             kwargs["tools"] = tools
@@ -256,7 +314,7 @@ class LLMService:
 
         try:
             response = await _with_retry(
-                lambda: self.openai_client.chat.completions.create(**kwargs), "OpenAI"
+                lambda: self._openai_create(dict(kwargs)), "OpenAI"
             )
             msg = response.choices[0].message
 
@@ -281,7 +339,7 @@ class LLMService:
         except Exception as e:
             logger.error(f"❌ OpenAI API error: {e}", exc_info=True)
             return await self._try_fallback(
-                messages, system_prompt, tools, temperature, json_mode, model_name
+                messages, system_prompt, tools, temperature, json_mode, model_name, e
             )
 
     async def _chat_gemini(
@@ -297,8 +355,29 @@ class LLMService:
         if not self.gemini_client:
             logger.warning("⚠️ Gemini client not available, trying fallback")
             return await self._try_fallback(
-                messages, system_prompt, tools, temperature, json_mode, model_name
+                messages, system_prompt, tools, temperature, json_mode, model_name,
+                RuntimeError("no GEMINI_API_KEY configured"),
             )
+
+        # A thought_signature belongs to the model that issued it. Gemini rejects a
+        # replayed function call whose signature is missing, and equally rejects one
+        # carrying another model's — so a conversation cannot be handed over natively.
+        # Mid-conversation failover used to die here on a 400 with no fallback left:
+        # "Function call is missing a thought_signature in functionCall parts".
+        # When the calls are not ours to replay, the exchange travels as text instead.
+        # The new model loses the ability to continue the call, and keeps the facts.
+        # The test is who issued the call, not whether a signature came with it. Models
+        # differ: gemini-2.5-flash returns no thought_signature and needs none, while
+        # gemini-flash-latest rejects a replayed call that lacks one. Requiring a signature
+        # here degraded every multi-turn request on the model that never sends them.
+        replayable = all(
+            tc.get("signature_model") == model_name
+            for m in messages
+            if m["role"] == "assistant"
+            for tc in (m.get("tool_calls") or [])
+        )
+        if not replayable:
+            logger.info("↻ Replaying tool history as text: the calls are another model's")
 
         # Map history to Gemini format
         gemini_msgs = []
@@ -311,36 +390,34 @@ class LLMService:
 
             if m["role"] == "assistant" and m.get("tool_calls"):
                 for tc in m["tool_calls"]:
-                    # Gemini 3 rejects replayed function calls that have lost the
-                    # thought_signature it issued with the original call
-                    part = types.Part(
-                        function_call=types.FunctionCall(
-                            name=tc["name"], args=tc["arguments"]
+                    if replayable:
+                        part = types.Part(
+                            function_call=types.FunctionCall(
+                                name=tc["name"], args=tc["arguments"]
+                            )
                         )
-                    )
-                    if (
-                        tc.get("thought_signature")
-                        and tc.get("signature_model") == model_name
-                    ):
-                        part.thought_signature = tc["thought_signature"]
-                    parts.append(part)
+                        if tc.get("thought_signature"):
+                            part.thought_signature = tc["thought_signature"]
+                        parts.append(part)
+                    else:
+                        parts.append(
+                            types.Part(text=f"[called {tc['name']}({tc['arguments']})]")
+                        )
 
             if m["role"] == "tool":
-                # Gemini carries function responses on the user turn; a literal
-                # "function" role is rejected as an invalid role
-                gemini_msgs.append(
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(
-                                function_response=types.FunctionResponse(
-                                    name=m.get("name", "unknown"),
-                                    response={"result": m["content"]},
-                                )
-                            )
-                        ],
+                name = m.get("name", "unknown")
+                if replayable:
+                    # Gemini carries function responses on the user turn; a literal
+                    # "function" role is rejected as an invalid role
+                    part = types.Part(
+                        function_response=types.FunctionResponse(
+                            name=name, response={"result": m["content"]}
+                        )
                     )
-                )
+                else:
+                    # A function_response with no function_call before it is invalid too
+                    part = types.Part(text=f"[{name} returned: {m['content']}]")
+                gemini_msgs.append(types.Content(role="user", parts=[part]))
                 continue
 
             if parts:
@@ -362,6 +439,7 @@ class LLMService:
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=temperature,
+            max_output_tokens=settings.LLM_MAX_TOKENS,
             tools=tool_config,
             # Business documents trip low-confidence filters; block only high-confidence harm
             safety_settings=[
@@ -375,9 +453,7 @@ class LLMService:
             ],
         )
 
-        # JSON mode only: the Developer API rejects response_schema containing
-        # additionalProperties, which Pydantic emits for this schema's Dict[str, Any]
-        # fields. The shape is specified in the system prompt and parsed tolerantly.
+        # JSON mode only: the Developer API rejects response_schema containing additionalProperties, which Pydantic emits for this schema's Dict[str, Any] fields. The shape is specified in the system prompt and parsed tolerantly.
         if not tools:
             logger.info("🔒 JSON mode (Gemini final answer)")
             config.response_mime_type = "application/json"
@@ -401,7 +477,8 @@ class LLMService:
             if not response.candidates:
                 logger.warning("⚠️ No candidates in Gemini response")
                 return await self._try_fallback(
-                    messages, system_prompt, tools, temperature, json_mode, model_name
+                    messages, system_prompt, tools, temperature, json_mode, model_name,
+                    RuntimeError("provider returned no candidates"),
                 )
 
             candidate = response.candidates[0]
@@ -410,7 +487,8 @@ class LLMService:
             if not candidate.content or not candidate.content.parts:
                 logger.warning("⚠️ Empty or blocked Gemini response")
                 return await self._try_fallback(
-                    messages, system_prompt, tools, temperature, json_mode, model_name
+                    messages, system_prompt, tools, temperature, json_mode, model_name,
+                    RuntimeError("response empty or blocked by safety filters"),
                 )
 
             # Extract text
@@ -428,10 +506,6 @@ class LLMService:
                             "id": f"call_{part.function_call.name}_{uuid.uuid4().hex[:4]}",
                             "name": part.function_call.name,
                             "arguments": dict(part.function_call.args),
-                            # Carried so the call can be replayed on the next turn.
-                            # Tagged with its issuer: a signature from one model is
-                            # rejected by another, which broke every failover that
-                            # happened mid-conversation.
                             "thought_signature": getattr(
                                 part, "thought_signature", None
                             ),
@@ -443,8 +517,7 @@ class LLMService:
                 logger.debug(f"🔧 Extracted {len(tool_calls)} Gemini tool calls")
                 return {"content": content_text, "tool_calls": tool_calls}
 
-            # Gemini rejects response_schema alongside tools, so the answer is shaped
-            # in a second, tool-free pass that can carry the schema
+            # Gemini rejects response_schema alongside tools, so the answer is shaped in a second, tool-free pass that can carry the schema
             if tools and content_text:
                 logger.info("🔒 Reformatting Gemini answer under schema")
                 return await self._chat_gemini(
@@ -452,7 +525,15 @@ class LLMService:
                     + [
                         {
                             "role": "user",
-                            "content": f"Return this analysis as the required JSON:\n\n{content_text}",
+                            "content": (
+                                "Return this analysis as the required JSON, written in the "
+                                "language of the user's question quoted in your "
+                                "instructions. That governs `answer`, every "
+                                "`key_insights` entry, and every chart or diagram title. "
+                                "If the analysis below is in a different language from the "
+                                "question, translate it into the question's language now.\n\n"
+                                f"{content_text}"
+                            ),
                         }
                     ],
                     system_prompt,
@@ -474,7 +555,7 @@ class LLMService:
         except Exception as e:
             logger.error(f"❌ Gemini API error: {e}", exc_info=True)
             return await self._try_fallback(
-                messages, system_prompt, tools, temperature, json_mode, model_name
+                messages, system_prompt, tools, temperature, json_mode, model_name, e
             )
 
     async def _try_fallback(
@@ -485,28 +566,41 @@ class LLMService:
         temperature: float,
         json_mode: bool,
         failed_model: str = None,
+        cause: Optional[Exception] = None,
     ) -> Dict[str, Any]:
-        """Fallback mechanism; one hop only, so a dead fallback cannot loop"""
+        """
+        Fallback mechanism; one hop only, so a dead fallback cannot loop.
+
+        The reason travels with the answer. Falling back silently once meant a reply
+        produced by Gemini was presented as coming from gpt-4o, hiding both the switch
+        and the exhausted key behind it.
+        """
         if (
             not self.fallback_model
             or self.fallback_model == failed_model
             or self.fallback_model.lower() == "none"
         ):
             logger.error("❌ All LLM options exhausted.")
+            detail = _provider_reason(cause)
             return {
                 "content": json.dumps(
                     {
-                        "answer": "⚠️ System Error: The AI service is temporarily unavailable. Please try again.",
-                        "key_insights": ["Service disruption detected"],
+                        "answer": (
+                            f"⚠️ No model could answer this. {failed_model or 'The model'} "
+                            f"failed ({detail}) and no usable fallback is configured. "
+                            "The request was not processed."
+                        ),
+                        "key_insights": [f"{failed_model}: {detail}"],
                         "visualizations": [],
                         "sources_used": [],
                     }
                 ),
                 "tool_calls": [],
+                "degraded": f"{failed_model} failed ({detail}); no fallback available",
             }
 
         logger.info(f"⚠️ Falling back to: {self.fallback_model}")
-        return await self.chat(
+        result = await self.chat(
             messages,
             system_prompt,
             tools,
@@ -514,3 +608,8 @@ class LLMService:
             json_mode,
             model_override=self.fallback_model,
         )
+        result["degraded"] = (
+            f"{failed_model} failed ({_provider_reason(cause)}); "
+            f"answered with {self.fallback_model} instead"
+        )
+        return result

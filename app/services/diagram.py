@@ -20,6 +20,8 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
+_BRACKET_GRAMMARS = ("flowchart", "graph")
+
 SUPPORTED_TYPES = (
     "flowchart",
     "graph",
@@ -129,18 +131,28 @@ def build(mermaid: str, title: str = "Diagram") -> Dict[str, Any]:
             ),
         }
 
-    lines = [_sanitize_line(ln) for ln in source.splitlines()]
+    # Label quoting and the bracket check both model flowchart node syntax. Other
+    # grammars spend the same characters differently: an erDiagram cardinality
+    # (`USER ||--o{ ORDER`) has no closing brace at all, and a classDiagram opens a body
+    # on one line and closes it several lines later. Judging those by flowchart rules
+    # rejected valid diagrams — every ER diagram the agent wrote was refused — so they
+    # pass through as authored.
+    repaired = 0
+    if kind in _BRACKET_GRAMMARS:
+        lines = [_sanitize_line(ln) for ln in source.splitlines()]
 
-    for number, line in enumerate(lines, 1):
-        if _unbalanced(line):
-            return {
-                "success": False,
-                "error": f"Unbalanced brackets on line {number}: {line.strip()[:80]}",
-            }
+        for number, line in enumerate(lines, 1):
+            if _unbalanced(line):
+                return {
+                    "success": False,
+                    "error": f"Unbalanced brackets on line {number}: {line.strip()[:80]}",
+                }
 
-    repaired = sum(1 for a, b in zip(source.splitlines(), lines) if a != b)
-    if repaired:
-        logger.info(f"  🧹 Quoted labels on {repaired} line(s)")
+        repaired = sum(1 for a, b in zip(source.splitlines(), lines) if a != b)
+        if repaired:
+            logger.info(f"  🧹 Quoted labels on {repaired} line(s)")
+    else:
+        lines = source.splitlines()
 
     logger.info(f"  📐 {kind} diagram, {len(lines)} lines")
 

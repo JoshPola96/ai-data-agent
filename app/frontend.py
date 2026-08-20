@@ -125,6 +125,116 @@ def send_message(query, model=None):
         }
 
 
+def stream_message(query, model=None):
+    """
+    Run a question against /chat/stream, narrating each event, and return the answer.
+
+    Streamlit runs the script top to bottom on each interaction, so iterating a streamed
+    response inside that run is enough to update the page live — no callbacks, no async.
+    A ten-turn question can take a minute, and a spinner that says nothing for a minute
+    looks identical to a hang. Falls back to the blocking endpoint if the stream is
+    unavailable, so an older backend still works.
+    """
+    payload = {
+        "session_id": st.session_state.session_id,
+        "query": query,
+        "use_rag": st.session_state.use_rag,
+    }
+    if model:
+        payload["model"] = model
+
+    labels = {
+        "search_knowledge_base": "📚 Searching documents",
+        "calculate_statistics": "🧮 Calculating",
+        "query_data": "🔍 Filtering rows",
+        "generate_chart": "📊 Drawing a chart",
+        "generate_dashboard": "📊 Building a dashboard",
+        "generate_diagram": "📐 Drawing a diagram",
+    }
+
+    turn_label = {"text": "🤔 Thinking…", "turn": 0}
+
+    with st.status(turn_label["text"], expanded=True) as status:
+        def say(activity):
+            """Turn and activity in one label, so neither erases the other."""
+            status.update(label=f"{turn_label['text']} · {activity}")
+
+        # One placeholder rewritten in place: appending a widget per line would push the
+        # page down on every log record and make the panel unreadable.
+        log_lines, log_box = [], st.empty()
+
+        def show_log():
+            log_box.code("\n".join(log_lines[-22:]) or "waiting…", language="log")
+
+        try:
+            with requests.post(
+                f"{API_URL}/chat/stream", json=payload, timeout=300, stream=True
+            ) as resp:
+                if resp.status_code != 200:
+                    status.update(label="⚠️ Request rejected", state="error")
+                    return {"response": f"Error: {resp.text}", "sources": [],
+                            "metadata": {}, "agent_trace": []}
+
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    kind = event.get("type")
+
+                    if kind == "log":
+                        log_lines.extend(event["lines"])
+                        show_log()
+                    elif kind == "llm_call":
+                        offered = event["tools"]
+                        say(
+                            f"asking {event['model'].split(':')[-1]}"
+                            + (f", {offered} tools offered" if offered else ", no tools")
+                        )
+                        log_lines.append(
+                            f"→ {event['model']}: {event['messages']} messages, "
+                            f"{offered} tools"
+                        )
+                        show_log()
+                    elif kind == "context":
+                        tables = ", ".join(event["tables"]) or "none"
+                        st.caption(f"📋 Tables in scope: {tables}")
+                    elif kind == "turn":
+                        turn_label["turn"] = event["turn"]
+                        turn_label["text"] = f"🔄 Turn {event['turn']}/{event['of']}"
+                        say("thinking" if event["tools_offered"] else "answering, no tools left")
+                    elif kind == "thinking":
+                        if event.get("drafting"):
+                            say("drafting the answer")
+                        else:
+                            st.caption(f"💭 {event['text'][:300]}")
+                    elif kind == "tool_call":
+                        name = event["name"]
+                        say(labels.get(name, f"running {name}"))
+                        st.caption(f"🔧 `{name}` {json.dumps(event['args'])[:160]}")
+                    elif kind == "tool_result":
+                        icon = "❌" if event.get("failed") else "✅"
+                        st.caption(f"{icon} {event['name']} → {event['summary'][:160]}")
+                    elif kind == "notice":
+                        st.warning(event["text"])
+                    elif kind == "error":
+                        status.update(label="❌ Failed", state="error")
+                        return {"response": f"Error: {event['detail']}", "sources": [],
+                                "metadata": {}, "agent_trace": []}
+                    elif kind == "final":
+                        turns = turn_label["turn"]
+                        status.update(
+                            label=f"✅ Done · {turns} turn{'s' if turns != 1 else ''}",
+                            state="complete",
+                        )
+                        return event["response"]
+
+            status.update(label="⚠️ Stream ended without an answer", state="error")
+        except (requests.ConnectionError, requests.Timeout, ValueError) as e:
+            st.caption(f"↻ Streaming unavailable ({type(e).__name__}), falling back")
+
+    return send_message(query, model=model)
+
+
 def get_session_files():
     """Get list of uploaded files"""
     try:
@@ -184,7 +294,8 @@ def delete_file(doc_id):
     try:
         resp = requests.delete(
             f"{API_URL}/sessions/{st.session_state.session_id}/files/{doc_id}",
-            timeout=10,
+            # Deleting reindexes the surviving vectors. 10s used to expire mid-delete and report a failure the backend then completed anyway.
+            timeout=120,
         )
         return resp.status_code == 200
     except requests.RequestException:
@@ -196,7 +307,8 @@ def clear_session():
     try:
         resp = requests.delete(
             f"{API_URL}/sessions/{st.session_state.session_id}",
-            timeout=5,
+            # Drops every vector the session owns and reindexes, so it is not a 5s call
+            timeout=120,
         )
         return resp.status_code == 200
     except requests.RequestException:
@@ -243,6 +355,19 @@ def get_status():
 # ============================================================
 
 
+def chart_key(slot, chart_json):
+    """
+    A widget key unique across the whole transcript.
+
+    Content alone is not unique: ask the same question twice and both answers carry the
+    same figure, which collided on a content-derived key and Streamlit refused to render
+    the second — the panel showed an exception and dumped the entire Plotly payload into
+    the conversation. The slot carries the turn and the position within it, which is what
+    actually distinguishes two identical charts.
+    """
+    return f"chart_{slot}_{hash(str(chart_json))}"
+
+
 def render_chart(chart_data, slot=""):
     """
     Render Plotly chart with responsive sizing.
@@ -258,17 +383,14 @@ def render_chart(chart_data, slot=""):
         # Create figure from JSON
         fig = go.Figure(chart_json)
 
-        # Slot disambiguates identical figures in one dashboard, which would
-        # otherwise collide on a content-derived key
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=f"chart_{slot}_{hash(str(chart_json))}",
-        )
+        st.plotly_chart(fig, use_container_width=True, key=chart_key(slot, chart_json))
 
     except Exception as e:
+        # The payload carries an entire Plotly template, so dumping it put thousands of
+        # lines of theme JSON in the transcript and buried the answer above it.
         st.error(f"❌ Chart rendering failed: {e}")
-        st.code(json.dumps(chart_data, indent=2))
+        with st.expander("Chart payload", expanded=False):
+            st.code(json.dumps(chart_data, indent=2)[:4000], language="json")
 
 
 def render_diagram(mermaid, slot=""):
@@ -321,7 +443,7 @@ def render_visualization(viz, slot=""):
         st.caption(viz["caption"])
 
 
-def render_message(msg):
+def render_message(msg, turn=0):
     """Render a chat message with all its components"""
 
     with st.chat_message(msg["role"]):
@@ -335,18 +457,23 @@ def render_message(msg):
             for insight in msg["insights"]:
                 st.markdown(f"- {insight}")
 
+        if msg.get("assumptions"):
+            st.subheader("⚖️ Assumptions")
+            for note in msg["assumptions"]:
+                st.markdown(f"- {note}")
+
         # Visualizations (new format)
         if msg.get("visualizations"):
             st.divider()
             for i, viz in enumerate(msg["visualizations"]):
-                render_visualization(viz, f"hist{i}")
+                render_visualization(viz, f"hist{turn}_{i}")
                 if i < len(msg["visualizations"]) - 1:
                     st.markdown("")  # Spacing
 
         # Legacy chart support
         elif msg.get("chart"):
             st.divider()
-            render_chart(msg["chart"], "legacy")
+            render_chart(msg["chart"], f"legacy{turn}")
 
         # Sources
         if msg.get("sources"):
@@ -394,9 +521,6 @@ with st.sidebar:
         help="Supports: PDF, DOCX, XLSX, CSV, TXT",
     )
 
-    # The guard tracks which attachments have been ingested, so it must follow what
-    # the widget currently holds: dropping a file from the uploader should allow it to
-    # be added again, while a file still attached must not be re-ingested.
     attached = {f.name for f in uploaded_files or []}
     st.session_state.uploaded_files &= attached
 
@@ -529,9 +653,7 @@ with st.sidebar:
                     if st.button("🗑️", key=f"del_{f['doc_id']}", help="Delete file"):
                         with st.spinner("Deleting..."):
                             if delete_file(f["doc_id"]):
-                                # Deliberately not discarding from uploaded_files: the
-                                # file is still attached to the uploader, and clearing
-                                # the guard would make the next rerun re-ingest it.
+                                # Deliberately not discarding from uploaded_files: the file is still attached to the uploader, and clearing the guard would make the next rerun re-ingest it.
                                 st.success("Deleted")
                                 st.rerun()
                             else:
@@ -626,9 +748,11 @@ if status is None:
         icon="⏳",
     )
 
-# Display chat history
-for msg in st.session_state.messages:
-    render_message(msg)
+# Display chat history. The turn number is passed down because widget keys have to be
+# unique across the whole transcript, and a figure is not: ask the same question twice and
+# both answers carry the same chart.
+for turn, msg in enumerate(st.session_state.messages):
+    render_message(msg, turn)
 
 # Chat input
 if prompt := st.chat_input("Ask about your data..."):
@@ -638,10 +762,9 @@ if prompt := st.chat_input("Ask about your data..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Get AI response
+    # Get AI response, narrating each turn as it happens
     with st.chat_message("assistant"):
-        with st.spinner("🤔 Thinking..."):
-            resp = send_message(prompt, model=st.session_state.current_model)
+        resp = stream_message(prompt, model=st.session_state.current_model)
 
         # Display response
         st.markdown(resp["response"])
@@ -655,6 +778,12 @@ if prompt := st.chat_input("Ask about your data..."):
             st.subheader("💡 Key Insights")
             for insight in meta["key_insights"]:
                 st.markdown(f"- {insight}")
+
+        # What the figures rest on, beside the figures rather than in a follow-up
+        if meta.get("assumptions"):
+            st.subheader("⚖️ Assumptions")
+            for note in meta["assumptions"]:
+                st.markdown(f"- {note}")
 
         # Display visualizations
         vizs = meta.get("visualizations", [])
@@ -683,6 +812,10 @@ if prompt := st.chat_input("Ask about your data..."):
         if resp.get("agent_trace"):
             render_agent_trace(resp["agent_trace"])
 
+        # A failover is not a detail to bury in a log: the answer came from a model the reader did not choose, and the reason is usually theirs to act on.
+        if meta.get("degraded"):
+            st.warning(f"⚠️ {meta['degraded']}")
+
         if meta:
             tools = len([s for s in resp.get("agent_trace", []) if s["type"] == "tool_call"])
             st.caption(
@@ -700,6 +833,7 @@ if prompt := st.chat_input("Ask about your data..."):
             "chart": meta.get("chart"),
             "visualizations": vizs,
             "insights": meta.get("key_insights", []),
+            "assumptions": meta.get("assumptions", []),
             "sources": all_sources,
         }
     )
@@ -744,5 +878,5 @@ if not st.session_state.messages:
 # Footer
 st.divider()
 st.caption(
-    f"🤖 AI Data Agent v5.0 | Session: {st.session_state.session_id[:12]}... | Model: {st.session_state.current_model or 'Default'}"
+    f"🤖 AI Data Agent v5.0 | Session: {st.session_state.session_id[:12]}... | Selected: {st.session_state.current_model or 'Default'}"
 )

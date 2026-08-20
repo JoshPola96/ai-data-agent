@@ -14,6 +14,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from typing import Dict, Any, Optional, List
 from difflib import get_close_matches
+from app.utils.helpers import canonical_labels, to_numeric
 import json
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,16 @@ class ChartSpec:
     y2: Optional[str] = None
     color: Optional[str] = None
     aggregation: str = "none"
+    y2_aggregation: str = "mean"
+    normalize_keys: bool = False
     top_n: Optional[int] = None
     resample: Optional[str] = None
     reference: Optional[str] = None
     ratio: Optional[Dict[str, str]] = None
+    # How many groups existed before top_n trimmed them, when it did. A one-bar chart
+    # beside prose naming four regions is a contradiction the reader sees and the model
+    # does not, so the receipt has to say what was left out.
+    trimmed_from: Optional[int] = None
 
     @property
     def value_columns(self) -> List[str]:
@@ -51,6 +58,10 @@ class ChartSpec:
 
 class ChartService:
     """Enhanced chart generation service with Plotly"""
+
+    # Python equivalents of the d3 axis formats _value_format returns, so a reference
+    # annotation is written in the same units as the axis it labels.
+    _ANNOTATION_FORMATS = {".2%": "{:.2%}", ".3s": "{:,.0f}", ".4g": "{:,.4g}"}
 
     # Chart configurations for optimal rendering
     CHART_CONFIG = {
@@ -121,8 +132,8 @@ class ChartService:
             return None
 
         name = f"{num}_per_{den}"
-        df[num] = pd.to_numeric(df[num], errors="coerce")
-        df[den] = pd.to_numeric(df[den], errors="coerce")
+        df[num] = to_numeric(df[num])
+        df[den] = to_numeric(df[den])
         df[name] = df[num] / df[den].replace(0, np.nan)
 
         logger.info(f"  ➗ Derived '{name}' from {num}/{den}")
@@ -145,11 +156,34 @@ class ChartService:
             y2=col(request.get("y2_column")),
             color=col(request.get("color_column")),
             aggregation=request.get("aggregation", "none"),
+            y2_aggregation=request.get("y2_aggregation", "mean"),
+            normalize_keys=bool(request.get("normalize_keys")),
             top_n=request.get("top_n"),
             resample=request.get("resample"),
             reference=request.get("reference"),
             ratio=ratio,
         )
+
+    @staticmethod
+    def bucket_dates(df: pd.DataFrame, column: str, freq: str) -> pd.DataFrame:
+        """
+        Collapse a date column to period starts, so daily rows can answer a monthly
+        question.
+
+        Shared with the statistics tool rather than reimplemented there: only the chart
+        could bucket, so "which month was highest" had to be read off the picture, and a
+        figure read off a picture is a figure nobody checked.
+        """
+        dates = pd.to_datetime(df[column], errors="coerce")
+        if dates.notna().mean() <= 0.7:
+            logger.warning(f"  ⚠️ '{column}' is not a date column, resample skipped")
+            return df
+
+        bucketed = df.assign(
+            **{column: dates.dt.to_period(freq).dt.to_timestamp()}
+        ).dropna(subset=[column])
+        logger.info(f"  🗓 Resampled {column} to '{freq}' buckets")
+        return bucketed
 
     @staticmethod
     def _clean_and_sort_data(df: pd.DataFrame, x_col: str) -> pd.DataFrame:
@@ -176,27 +210,30 @@ class ChartService:
         """Clean, optionally resample the time axis, aggregate, then trim to a ranking."""
         x, y = spec.x, spec.y
 
+        # Four regions written nine ways chart as nine bars, and every total is split
+        # between the spellings. Collapsing them is opt-in: elsewhere two values that
+        # differ only in case are genuinely two values.
+        if spec.normalize_keys:
+            for col in (x, spec.color):
+                if col and col in df.columns and df[col].dtype.kind not in "ifbcmM":
+                    before = df[col].nunique()
+                    df[col] = canonical_labels(df[col])
+                    after = df[col].nunique()
+                    if after < before:
+                        logger.info(f"  ⇢ Normalised '{col}': {before} labels to {after}")
+
         # Categorical charts need string x-axis
         if spec.chart_type in ("bar", "pie") and not spec.resample:
             df[x] = df[x].astype(str).fillna("Unknown")
 
         for col in spec.value_columns:
             if col != "count" and col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = to_numeric(df[col])
         if y and y != "count" and y in df.columns:
             df = df.dropna(subset=[y])
 
-        # Daily rows rarely answer a monthly question. Bucketing the axis before
-        # aggregation is what turns transaction-level data into a readable trend.
         if spec.resample and x:
-            dates = pd.to_datetime(df[x], errors="coerce")
-            if dates.notna().mean() > 0.7:
-                df = df.assign(
-                    **{x: dates.dt.to_period(spec.resample).dt.to_timestamp()}
-                ).dropna(subset=[x])
-                logger.info(f"  🗓 Resampled {x} to '{spec.resample}' buckets")
-            else:
-                logger.warning(f"  ⚠️ '{x}' is not a date column, resample skipped")
+            df = ChartService.bucket_dates(df, x, spec.resample)
 
         if spec.aggregation != "none":
             keys = [x]
@@ -215,19 +252,23 @@ class ChartService:
                 spec.y = y = "count"
                 logger.info(f"  📊 Aggregated: count by {keys}")
             else:
-                measures = [c for c in spec.value_columns if c in df.columns]
-                if measures:
-                    df = (
-                        df.groupby(keys, sort=False)[measures]
-                        .agg(spec.aggregation)
-                        .reset_index()
-                    )
-                    logger.info(
-                        f"  📊 Aggregated: {spec.aggregation}({measures}) by {keys}"
-                    )
+                how = {
+                    c: spec.aggregation for c in spec.value_columns if c in df.columns
+                }
+                # A secondary axis exists to carry a different *kind* of measure — a
+                # percentage, a rate, an index. Summing one is meaningless: margin_pct
+                # summed over 48 rows per region put 990 on the right-hand axis and read
+                # as a margin collapse. It gets its own function, mean unless asked.
+                if spec.y2 and spec.y2 in how:
+                    how[spec.y2] = spec.y2_aggregation
+                if how:
+                    df = df.groupby(keys, sort=False).agg(how).reset_index()
+                    logger.info(f"  📊 Aggregated: {how} by {keys}")
 
         # "Top 10 products by revenue" is a ranking, not a full plot
         if spec.top_n and y and y in df.columns:
+            if len(df) > int(spec.top_n):
+                spec.trimmed_from = len(df)
             df = df.nlargest(int(spec.top_n), y)
             logger.info(f"  🔝 Trimmed to top {spec.top_n} by {y}")
 
@@ -249,18 +290,41 @@ class ChartService:
         return None
 
     @staticmethod
-    def _calculate_summary_stats(df: pd.DataFrame, y_col: Optional[str]) -> str:
-        """Calculate summary statistics for the chart"""
-        if not y_col or df.empty:
+    def _calculate_summary_stats(
+        df: pd.DataFrame, y_col: Optional[str], x_col: Optional[str] = None
+    ) -> str:
+        """
+        Describe the figure to whoever has to write about it.
+
+        The values are the ones plotted, after normalising, aggregating and trimming —
+        which is why they belong in the receipt. Given only "Max/Min/Avg" the model wrote
+        its prose from an earlier statistics call instead, and named a leader at 282.32
+        above a bar reading 273.2. A small categorical chart therefore reports every
+        point, so the text has the drawn numbers to quote.
+        """
+        if not y_col or df.empty or y_col not in df.columns:
             return "Chart created successfully."
 
         try:
-            max_val = df[y_col].max()
-            min_val = df[y_col].min()
-            avg_val = df[y_col].mean()
+            values = to_numeric(df[y_col]).dropna()
+            if values.empty:
+                return "Chart created successfully."
 
-            summary = f"Max: {max_val:.2f}, Min: {min_val:.2f}, Avg: {avg_val:.2f}"
-            logger.info(f"  📈 Stats: {summary}")
+            summary = (
+                f"Max: {values.max():.2f}, Min: {values.min():.2f}, "
+                f"Avg: {values.mean():.2f}"
+            )
+
+            if x_col and x_col in df.columns and len(df) <= 12:
+                points = ", ".join(
+                    f"{label}={value:.2f}"
+                    for label, value in zip(df[x_col].astype(str), to_numeric(df[y_col]))
+                    if pd.notna(value)
+                )
+                if points:
+                    summary = f"Plotted: {points}. {summary}"
+
+            logger.info(f"  📈 Stats: {summary[:160]}")
             return summary
         except Exception as e:
             logger.debug(f"  ℹ️  Stats calculation skipped: {e}")
@@ -279,7 +343,7 @@ class ChartService:
             return ".4g"
 
         try:
-            peak = pd.to_numeric(df[y_col], errors="coerce").abs().max()
+            peak = to_numeric(df[y_col]).abs().max()
         except Exception:
             return ".4g"
 
@@ -340,7 +404,12 @@ class ChartService:
             )
 
         else:
-            fig = px.bar(df, x=x, y=y, title=title)
+            # Quietly drawing a bar chart for an unrecognised type hands back a figure
+            # that answers a different question than the one asked.
+            raise ValueError(
+                f"Unsupported chart_type '{kind}'. Supported: "
+                "bar, line, pie, scatter, histogram, box, heatmap"
+            )
 
         # Side-by-side reads better than stacked when a series is broken out
         if color and kind == "bar":
@@ -400,7 +469,7 @@ class ChartService:
         if not spec.reference or not spec.y or spec.y not in df.columns:
             return fig
 
-        series = pd.to_numeric(df[spec.y], errors="coerce")
+        series = to_numeric(df[spec.y])
         choice = str(spec.reference).strip().lower()
 
         if choice == "mean":
@@ -417,15 +486,52 @@ class ChartService:
         if pd.isna(value):
             return fig
 
+        # The annotation has to agree with the axis it sits on. Both read from the same
+        # format decision: a rate axis labelled "3.44%" beside "mean: 0.03" looks like a
+        # reference to some other number entirely.
+        text = f"{label}: " + ChartService._ANNOTATION_FORMATS.get(
+            ChartService._value_format(df, spec.y), "{:,.2f}"
+        ).format(value)
+
         fig.add_hline(
             y=value,
             line_dash="dash",
             line_color="rgba(0,0,0,0.45)",
-            annotation_text=f"{label}: {value:,.2f}",
+            annotation_text=text,
             annotation_position="top left",
         )
-        logger.info(f"  📏 Reference line at {label} = {value:,.2f}")
+        logger.info(f"  📏 Reference line at {text}")
         return fig
+
+    @staticmethod
+    def _reference_split(df: pd.DataFrame, spec: ChartSpec, text: str) -> str:
+        """
+        Name which plotted points sit above the baseline and which below.
+
+        The receipt already carried every bar and the average, and the model still wrote
+        that two regions were above a line only one of them cleared — 423,699 read as
+        above 428,737. It had the figures; comparing them was the step that failed. So the
+        comparison is done here, where it is arithmetic rather than recollection.
+        """
+        if not spec.x or spec.x not in df.columns or not spec.y or spec.y not in df.columns:
+            return ""
+
+        try:
+            threshold = float(text.split(":")[-1].strip().replace(",", "").rstrip("%"))
+        except ValueError:
+            return ""
+
+        values = to_numeric(df[spec.y])
+        labels = df[spec.x].astype(str)
+        if values.isna().all() or len(df) > 30:
+            return ""
+
+        above = [l for l, v in zip(labels, values) if pd.notna(v) and v > threshold]
+        below = [l for l, v in zip(labels, values) if pd.notna(v) and v <= threshold]
+        return (
+            f" Above it: {', '.join(above) or 'none'}."
+            f" At or below: {', '.join(below) or 'none'}."
+        )
 
     @staticmethod
     def _apply_layout_enhancements(fig: go.Figure, chart_type: str) -> go.Figure:
@@ -498,13 +604,41 @@ class ChartService:
                 return {"success": False, "error": "No data remaining after processing"}
 
             if not spec.y and spec.chart_type not in ("histogram", "heatmap"):
+                # Auto-selection is for a request that omits y. A y that was *named* and
+                # did not resolve is a different situation: falling through to the first
+                # numeric column — or to a row count — answers a question nobody asked,
+                # and the chart looks entirely convincing.
+                requested = request.get("y_column")
+                if requested:
+                    error = (
+                        f"Column '{requested}' not found. "
+                        f"Available: {list(plot_df.columns)}"
+                    )
+                    logger.error(f"  ❌ {error}")
+                    return {"success": False, "error": error}
                 spec.y = ChartService._auto_select_y_column(plot_df, spec.chart_type)
 
             fig = ChartService._create_plotly_figure(plot_df, spec)
             fig = ChartService._add_reference(fig, plot_df, spec)
             fig = ChartService._apply_layout_enhancements(fig, spec.chart_type)
 
-            summary = ChartService._calculate_summary_stats(plot_df, spec.y)
+            summary = ChartService._calculate_summary_stats(plot_df, spec.y, spec.x)
+
+            # "Which region leads?" was answered in prose about four regions above a chart
+            # of one, because top_n=1 trimmed the figure and nothing said so.
+            if spec.trimmed_from:
+                summary = (
+                    f"{summary} Shows only the top {len(plot_df)} of "
+                    f"{spec.trimmed_from} groups — say so, or plot them all."
+                )
+
+            # Where the baseline was actually drawn. A model that passes a figure of its
+            # own then describes "the average" as that figure, while the bars average
+            # something else; with both in the receipt the discrepancy is at least visible.
+            drawn = (fig.layout.annotations or [{}])[0]
+            if getattr(drawn, "text", None):
+                summary = f"{summary} Reference line: {drawn.text}."
+                summary += ChartService._reference_split(plot_df, spec, drawn.text)
 
             logger.info(f"  ✅ Chart ready ({len(plot_df)} rows plotted)")
             logger.info("=" * 60)

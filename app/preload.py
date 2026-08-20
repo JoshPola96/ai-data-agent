@@ -15,9 +15,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Read from the environment rather than app.core.config: this layer costs ~4GB to
-# rebuild, and importing config would make every settings edit invalidate it.
-# Defaults mirror Settings.EMBEDDING_MODEL / Settings.RERANKER_MODEL.
+# Read from the environment rather than app.core.config: this layer costs ~4GB to rebuild, and importing config would make every settings edit invalidate it. Defaults mirror Settings.EMBEDDING_MODEL / Settings.RERANKER_MODEL.
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
@@ -50,9 +48,7 @@ def load_model_smart(build, model_name, model_type="Model"):
 
 def preload():
     """Preload all models into cache"""
-    # HF_HOME governs the cache for every library here. Naming it explicitly as
-    # sentence-transformers' cache_folder created a second root beside $HF_HOME/hub
-    # and downloaded the same 2GB of weights into both.
+    # HF_HOME governs the cache for every library here. Naming it explicitly as sentence-transformers' cache_folder created a second root beside $HF_HOME/hub and downloaded the same 2GB of weights into both.
     hf_cache = os.environ.get("HF_HOME", "/app/.cache/huggingface")
     logger.info("=" * 80)
     logger.info("📦 SMART MODEL PRELOADING")

@@ -1,6 +1,8 @@
 """Reference lines, secondary axes and time resampling."""
 
+import base64
 import json
+import struct
 import unittest
 
 import pandas as pd
@@ -16,6 +18,15 @@ DAILY = pd.DataFrame(
         "region": ["North", "South"] * 45,
     }
 )
+
+
+def values(arr):
+    """Plotly encodes numeric arrays as base64 typed-arrays, not JSON lists."""
+    if isinstance(arr, dict) and "bdata" in arr:
+        fmt = {"i1": "b", "i2": "h", "i4": "i", "i8": "q", "u1": "B", "f4": "f", "f8": "d"}[arr["dtype"]]
+        raw = base64.b64decode(arr["bdata"])
+        return list(struct.unpack("<" + fmt * (len(raw) // struct.calcsize(fmt)), raw))
+    return list(arr)
 
 
 class ChartOptionTest(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +104,28 @@ class SecondaryAxisTest(ChartOptionTest):
         )
         self.assertTrue(out["success"], out.get("error"))
         self.assertIn("yaxis2", out["chart_json"]["layout"])
+
+    async def test_a_secondary_percentage_is_averaged_not_summed(self):
+        """
+        Observed live: revenue and margin_pct by region put ~990 on the right-hand axis,
+        because the primary `sum` was applied to the percentage as well. margin_pct is
+        12-16 here, so any region total above 20 means it was summed.
+        """
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="revenue",
+            y2_column="margin_pct", aggregation="sum",
+        )
+        second = [t for t in out["chart_json"]["data"] if t.get("yaxis") == "y2"][0]
+        ys = values(second["y"])
+        self.assertTrue(all(10 < v < 20 for v in ys), f"y2 not averaged: {ys}")
+
+    async def test_a_summed_secondary_axis_is_still_available(self):
+        out = await self.chart(
+            chart_type="bar", x_column="region", y_column="revenue",
+            y2_column="margin_pct", aggregation="sum", y2_aggregation="sum",
+        )
+        second = [t for t in out["chart_json"]["data"] if t.get("yaxis") == "y2"][0]
+        self.assertTrue(max(values(second["y"])) > 100, "explicit sum was overridden")
 
     async def test_unknown_second_column_is_ignored(self):
         out = await self.chart(
@@ -183,6 +216,16 @@ class SpecTest(unittest.TestCase):
     def test_unknown_columns_resolve_to_none(self):
         spec = ChartService.resolve(DAILY, chart_type="bar", x_column="ghost")
         self.assertIsNone(spec.x)
+
+    def test_a_reference_label_matches_the_axis_units(self):
+        """A rate axis reading 3.44% beside "mean: 0.03" names a different number."""
+        rates = pd.DataFrame({"cat": ["a", "b"], "rate": [0.041, 0.021]})
+        out = ChartService.generate_chart(
+            rates, chart_type="bar", x_column="cat", y_column="rate", reference="mean"
+        )
+        text = json.dumps(out["chart_json"]["layout"])
+        self.assertIn("3.10%", text)
+        self.assertNotIn("mean: 0.03", text)
 
     def test_value_columns_are_ordered(self):
         spec = ChartService.resolve(

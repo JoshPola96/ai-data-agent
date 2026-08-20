@@ -90,3 +90,48 @@ class DashboardLimitsTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionIdRulesMatchAcrossEndpoints(unittest.TestCase):
+    """
+    /upload validated nothing while /chat enforced a charset, so a file could be uploaded
+    under an id that could never be asked a question — and the restriction exists because
+    the id is interpolated into Redis keys, which makes the unvalidated door the wrong one
+    to leave open.
+    """
+
+    def test_both_endpoints_share_one_pattern(self):
+        import inspect
+
+        import app.main as main
+        from app.utils.schemas import SESSION_ID_PATTERN, ChatRequest
+
+        chat_rule = ChatRequest.model_fields["session_id"]
+        self.assertTrue(
+            any(getattr(m, "pattern", None) == SESSION_ID_PATTERN for m in chat_rule.metadata),
+            "ChatRequest should use the shared pattern",
+        )
+
+        # Form keeps its constraints in annotated metadata rather than as attributes
+        upload_rule = inspect.signature(main.upload).parameters["session_id"].default
+        constraints = list(upload_rule.metadata)
+        self.assertTrue(
+            any(getattr(c, "pattern", None) == SESSION_ID_PATTERN for c in constraints),
+            f"/upload should share the pattern; has {constraints}",
+        )
+        self.assertTrue(
+            any(getattr(c, "max_length", None) == main.settings.MAX_SESSION_ID_CHARS
+                for c in constraints),
+            f"/upload should share the length bound; has {constraints}",
+        )
+
+    def test_the_pattern_rejects_what_would_break_a_key(self):
+        import re
+
+        from app.utils.schemas import SESSION_ID_PATTERN
+
+        allowed = re.compile(SESSION_ID_PATTERN)
+        for good in ("abc", "a_b-1", "A1"):
+            self.assertTrue(allowed.match(good), good)
+        for bad in ("has space", "dots.in.name", "colon:sep", "star*", ""):
+            self.assertFalse(allowed.match(bad), bad)

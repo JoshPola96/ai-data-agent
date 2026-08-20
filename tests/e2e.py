@@ -56,6 +56,12 @@ def chat(sid, q, rag=True):
 def charts(d):
     return [v for v in d.get("metadata", {}).get("visualizations", []) if v.get("type") == "chart"]
 
+# Sessions live for SESSION_TTL, so a second run inside the hour inherits the first run's
+# history — and the agent then answers the RAG question from that history instead of
+# retrieving, citing nothing. Start from a clean slate so the suite is repeatable.
+for sid in (ALICE, BOB):
+    requests.delete(f"{API}/sessions/{sid}", timeout=60)
+
 print("\n=== 1. INGESTION ===")
 r = requests.post(f"{API}/upload", files={"file": ("sales.csv", io.StringIO(CSV), "text/csv")},
                   data={"session_id": ALICE}, timeout=180)
@@ -90,10 +96,17 @@ check("generate_dashboard" in tools or n >= 2, "dashboard tool or multiple chart
 
 print("\n=== 4. MULTILINGUAL RAG (LLM call 3) ===")
 d = chat(ALICE, "According to the knowledge base, what are the eligibility conditions to register as a job seeker?")
-low = d["response"].lower()
 check(len(d["response"]) > 120, f"substantive answer  [{d['_elapsed']}s]")
-check(any(k in low for k in ["omani", "18", "age", "citizen", "national"]),
-      "answered from Arabic KB in English: " + d["response"][:90].replace("\n", " "))
+
+# Assert on the script, not on keywords. The previous check accepted any of
+# ["omani", "18", "age", ...] — and an entirely Arabic answer contains "18", because
+# Arabic writes Western digits. It passed while demonstrating the exact bug it existed
+# to catch. Counting letters is unambiguous: an English reply is mostly Latin.
+letters = [c for c in d["response"] if c.isalpha()]
+arabic = sum(1 for c in letters if "؀" <= c <= "ۿ")
+check(letters and arabic / len(letters) < 0.2,
+      f"English question answered in English ({arabic}/{len(letters)} Arabic letters): "
+      + d["response"][:70].replace("\n", " "))
 check(bool(d.get("sources")), f"cited sources: {d.get('sources')}")
 
 print("\n=== 5. SESSION ISOLATION (LLM call 4) ===")

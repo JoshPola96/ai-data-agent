@@ -6,6 +6,7 @@ Production-grade parsing with universal data type handling and comprehensive log
 """
 
 import asyncio
+import hashlib
 import io
 import logging
 import os
@@ -19,9 +20,17 @@ import numpy as np
 from app.core.config import get_settings
 from app.core.session import SessionStore
 from app.core.vectorstore import VectorStore
+from app.utils.helpers import to_numeric, totals_row_index
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+# Every text-cleaning pass selects on this. Under pandas 3 a string column answers to
+# "object" only for backward compatibility, and pandas 4 removes that — at which point
+# selecting "object" alone would match nothing, and date detection, currency conversion
+# and whitespace collapsing would each quietly become a no-op on the columns they exist
+# to fix. Naming both dtypes costs nothing and survives the removal.
+_TEXT_DTYPES = ["object", "string"]
 
 
 class IngestionService:
@@ -61,8 +70,33 @@ class IngestionService:
 
         logger.info(f"Size: {actual_file_size:,} bytes")
 
-        doc_id = doc_id or self._generate_doc_id(filename)
+        # Identity comes from the bytes, so the same file uploaded twice is the same
+        # document. A random id made every upload new: two clicks left two registry
+        # entries and two copies of every chunk competing for the same top-k slots, and
+        # re-uploading a corrected file left the superseded version in the index forever,
+        # answering from data the user believed they had replaced.
+        doc_id = doc_id or self._content_doc_id(filename, content, file_path)
         logger.info(f"Document ID: {doc_id}")
+
+        already = await self.session_store.get_session_documents(session_id)
+
+        # The registry alone is not evidence the document is still searchable. The index
+        # is discarded whenever it disagrees with its sidecar — a changed embedding model,
+        # a torn write, a lost volume — while Redis survives, and every file then looked
+        # "unchanged" and was skipped. The knowledge base came up empty and stayed empty,
+        # because re-ingesting is exactly what the skip prevented.
+        registered = any(d.get("doc_id") == doc_id for d in already)
+        if registered and await self.vector_store.count_by_source(filename, session_id):
+            logger.info(f"⏭ '{filename}' is byte-identical to a copy already here")
+            return {
+                "filename": filename,
+                "doc_id": doc_id,
+                "text_chunks": 0,
+                "dataframes": 0,
+                "status": "unchanged",
+            }
+        if registered:
+            logger.warning(f"↻ '{filename}' is registered but not indexed, re-ingesting")
 
         try:
             # Parse file (pass both content and file_path)
@@ -72,6 +106,25 @@ class IngestionService:
 
             logger.info(f"✓ Extracted {len(text_chunks)} text chunks")
             logger.info(f"✓ Extracted {len(dataframes)} tables")
+
+            # Parsers return empty on failure rather than raising, so an unsupported or
+            # corrupt file used to be reported as a successful upload with nothing in it.
+            # The file then sat in the sidebar, unqueryable, looking ingested.
+            if not text_chunks and not dataframes:
+                raise ValueError(
+                    f"Nothing could be extracted from '{filename}'. It may be corrupt, "
+                    "empty, password-protected, or a scanned image with no text layer. "
+                    "Supported formats: PDF, DOCX, XLSX, XLS, CSV, TXT."
+                )
+
+            # Only now is the previous version expendable. Superseding before parsing
+            # meant re-uploading a corrupt copy of a good file deleted the good one and
+            # then failed — the upload the user ran to refresh their data destroyed it.
+            for old in [d for d in already if d.get("filename") == filename]:
+                logger.info(f"♻ '{filename}' has changed, replacing the previous version")
+                await self.session_store.delete_document(
+                    session_id, old["doc_id"], self.vector_store
+                )
 
             # Ownership stamp drives retrieval scoping and session deletion
             for chunk in text_chunks:
@@ -202,7 +255,18 @@ class IngestionService:
         # 5. Clean string columns
         clean_df = self._clean_string_columns(clean_df)
 
-        # 6. Remove completely empty rows/columns
+        # 6. Drop a totals line loaded as data
+        # Stating it in the profile was not enough: asked for a total, the agent read the
+        # warning and answered 7,208 anyway — exactly double — treating the summary row as
+        # a site called "Unknown". A row that is provably the sum of the others is an
+        # artefact of the export, not an observation, so it is removed here and the removal
+        # is reported rather than hidden.
+        totals = totals_row_index(clean_df)
+        if totals is not None:
+            logger.info(f"   ➖ Dropped a totals row from '{table_name}' (row {totals})")
+            clean_df = clean_df.drop(index=totals)
+
+        # 7. Remove completely empty rows/columns
         clean_df = clean_df.dropna(how="all").dropna(axis=1, how="all")
 
         logger.debug(f"   Output shape: {clean_df.shape}")
@@ -220,15 +284,26 @@ class IngestionService:
 
     def _split_merged_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Split columns that contain both text and numbers.
-        Example: "Basic Pay 5000" -> "Basic Pay" | "5000"
+        Expose the number inside a text column, without consuming the text.
+
+        A payslip exported as "Basic Pay 5000" hides a figure nothing can sum, so the
+        number is lifted into its own column. It used to *replace* the original with the
+        text part, which is indistinguishable from destroying the data: "Widget 500" and
+        "Widget 750" both became "Widget", two products collapsed into one, and any
+        grouping then double-counted them silently. "Report 2024" and "Report 2025" went
+        the same way.
+
+        There is no reliable signal separating a merged column from a product name —
+        "Basic Pay 5000" and "Widget 500" are the same shape — so the split is additive.
+        The original column is never touched, and the extracted number arrives beside it.
+        Getting it wrong now costs a spare column instead of an identity.
         """
         # Pattern: Text followed by space and number
         merged_pattern = r"^(.+?)\s+([\d,]+(?:\.\d{1,2})?)$"
 
         new_columns = {}
 
-        for col in df.select_dtypes(include=["object"]).columns:
+        for col in df.select_dtypes(include=_TEXT_DTYPES).columns:
             # Check if column values match the pattern
             matches = df[col].astype(str).str.match(merged_pattern)
             match_rate = matches.mean()
@@ -240,15 +315,16 @@ class IngestionService:
 
                 try:
                     extracted = df[col].astype(str).str.extract(merged_pattern)
-
-                    # Update original to text part
-                    df[col] = extracted[0].str.strip()
-
-                    # Create new numeric column
-                    new_col_name = f"{col}_Value"
-                    new_columns[new_col_name] = pd.to_numeric(
+                    values = pd.to_numeric(
                         extracted[1].str.replace(",", "", regex=False), errors="coerce"
                     )
+                    # The original column stays exactly as it arrived; only the derived
+                    # figure is added, and only when enough of it actually parsed.
+                    if values.notna().mean() > 0.4:
+                        new_columns[f"{col}_Value"] = values
+                        logger.info(
+                            f"   ＋ Derived '{col}_Value' from '{col}'; '{col}' unchanged"
+                        )
 
                 except Exception as e:
                     logger.warning(f"   ⚠️ Failed to split column {col}: {e}")
@@ -261,9 +337,11 @@ class IngestionService:
 
     def _detect_and_convert_dates(self, df: pd.DataFrame) -> pd.DataFrame:
         """Detect and convert date columns"""
-        for col in df.select_dtypes(include=["object"]).columns:
-            # Skip if column is in force string list
-            if col.lower() in [x.lower() for x in settings.FORCE_STRING_COLUMNS]:
+        for col in df.select_dtypes(include=_TEXT_DTYPES).columns:
+            # str(), because a column name is not always a string: a header row of years
+            # loads as integers and `col.lower()` then raised AttributeError, taking the
+            # whole file down rather than one column.
+            if str(col).lower() in [x.lower() for x in settings.FORCE_STRING_COLUMNS]:
                 continue
 
             # Try date conversion
@@ -293,19 +371,40 @@ class IngestionService:
 
         return df
 
+    @staticmethod
+    def _is_identifier(name: str, series: pd.Series) -> bool:
+        """
+        True when a column labels rows rather than measuring them.
+
+        Two independent signals, so neither has to be complete. The name is matched
+        against FORCE_STRING_COLUMNS as whole `_`-separated tokens — "id" catches
+        `customer_id` without "no" catching `notes` — and the values are checked for
+        zero padding, because nothing meant to be added up is written `00067`. Converting
+        anyway drops the padding and lets a customer number into the correlation matrix
+        as though it were a measure.
+        """
+        lowered = str(name).lower().strip()
+        parts = set(re.split(r"[^a-z0-9]+", lowered))
+        if any(
+            lowered == token.lower() or token.lower() in parts
+            for token in settings.FORCE_STRING_COLUMNS
+        ):
+            return True
+
+        text = series.dropna().astype(str).str.strip()
+        return bool(len(text)) and text.str.fullmatch(r"0\d+").any()
+
     def _smart_numeric_conversion(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convert columns to numeric if appropriate"""
-        for col in df.select_dtypes(include=["object"]).columns:
-            # Skip if in force string list
-            if col.lower() in [x.lower() for x in settings.FORCE_STRING_COLUMNS]:
-                logger.debug(
-                    f"   ⊘ Skipping numeric conversion for '{col}' (force string)"
-                )
+        for col in df.select_dtypes(include=_TEXT_DTYPES).columns:
+            if self._is_identifier(col, df[col]):
+                logger.debug(f"   ⊘ Keeping '{col}' as text (identifier, not a measure)")
                 continue
 
-            # Clean and try conversion
-            clean_series = df[col].astype(str).str.replace(r"[^\d\.\-]", "", regex=True)
-            numeric_series = pd.to_numeric(clean_series, errors="coerce")
+            # One cleaner for the whole app. Stripping every non-digit character was
+            # close but blunt: it read the European "1,5" as 15 and turned the
+            # accounting negative "(300)" into 300.
+            numeric_series = to_numeric(df[col])
 
             # Convert if enough values are valid numbers
             valid_rate = numeric_series.notna().mean()
@@ -319,7 +418,7 @@ class IngestionService:
 
     def _clean_string_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean string columns"""
-        for col in df.select_dtypes(include=["object"]).columns:
+        for col in df.select_dtypes(include=_TEXT_DTYPES).columns:
             # Strip whitespace
             df[col] = df[col].astype(str).str.strip()
 
@@ -477,10 +576,22 @@ class IngestionService:
                 logger.debug(f"   Processing sheet: {sheet}")
 
                 try:
-                    df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+                    scan = pd.read_excel(
+                        xls, sheet_name=sheet, dtype=str, header=None, nrows=8
+                    )
+                    start = self._header_row(scan)
+                    df = pd.read_excel(
+                        xls, sheet_name=sheet, dtype=str, header=start
+                    )
+                    if start:
+                        logger.info(f"     ↧ '{sheet}': header found on row {start + 1}")
 
                     if not df.empty:
-                        tbl_name = self._clean_name(f"{filename}_{sheet}")
+                        # Cleaned separately: the sheet name sits after the extension,
+                        # and cleaning the pair as one string used to discard it.
+                        tbl_name = (
+                            f"{self._clean_name(filename)}_{self._clean_name(sheet)}"
+                        )
                         dataframes[tbl_name] = df
 
                         logger.debug(f"     ✓ {tbl_name}: {df.shape}")
@@ -511,13 +622,50 @@ class IngestionService:
         logger.info(f"📊 Parsing CSV: {filename}")
 
         try:
-            # Use file path directly
-            target = file_path if file_path else io.BytesIO(content)
-            df = pd.read_csv(target, dtype=str)
+            raw = open(file_path, "rb").read() if file_path else content
+
+            # Encoding first, because getting it wrong rejects the whole file rather than
+            # mangling a cell. Excel's "Unicode Text" export is UTF-16, and a European
+            # Excel writes cp1252 — both raised UnicodeDecodeError and the upload was
+            # refused as unreadable, which reads as "your file is broken".
+            # UTF-16 is tried only behind its byte-order mark. Without one it is not
+            # detectable — it decodes almost any even-length input into mojibake, which
+            # swallowed a perfectly good cp1252 file and produced an empty table.
+            ladder = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+            if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                ladder = ("utf-16",) + ladder
+
+            text = None
+            for encoding in ladder:
+                try:
+                    text = raw.decode(encoding)
+                    if encoding not in ("utf-8-sig", "utf-8"):
+                        logger.info(f"   ↻ Decoded as {encoding}")
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            if text is None:
+                raise ValueError("could not decode the file in any known encoding")
+
+            # Then the delimiter, chosen by which one actually splits the file. Sniffing
+            # with sep=None missed pipes on a short file and left every row as one string.
+            df = None
+            for sep in (",", ";", "\t", "|"):
+                try:
+                    candidate = pd.read_csv(io.StringIO(text), dtype=str, sep=sep)
+                except Exception:
+                    continue
+                if df is None or candidate.shape[1] > df.shape[1]:
+                    df = candidate
+            if df is None:
+                raise ValueError("no delimiter produced a readable table")
+
             logger.info(f"   Shape: {df.shape}")
 
             tbl_name = self._clean_name(filename)
-            text_chunks = self._semantic_chunking(df.to_string(), filename, doc_id)
+            text_chunks = self._semantic_chunking(
+                self._table_as_text(df, tbl_name), filename, doc_id
+            )
 
             logger.info(f"✅ CSV parsed: {len(text_chunks)} chunks, 1 table")
             return text_chunks, {tbl_name: df}
@@ -555,6 +703,44 @@ class IngestionService:
     # CHUNKING
     # =========================================================================
 
+    @staticmethod
+    def _header_row(scan: pd.DataFrame) -> int:
+        """
+        Find the row carrying the column names.
+
+        Exported reports open with a title and a "generated on" date, so the real header
+        sits two or three rows down. Taken as-is, the title becomes the column names —
+        `['Operations Export', 'Unnamed: 1', ...]` — the true header becomes the first
+        row of data, and nothing in the sheet can be addressed by the name it actually
+        has. The widest row wins, earliest on a tie, because a header names every column
+        while a title occupies one cell.
+        """
+        if scan.empty:
+            return 0
+
+        filled = scan.notna().sum(axis=1)
+        widest = int(filled.max())
+        if widest < 2:
+            return 0
+        return int(filled[filled == widest].index[0])
+
+    @staticmethod
+    def _table_as_text(df: pd.DataFrame, label: str) -> str:
+        """
+        A searchable description of a table, not a transcript of it.
+
+        Retrieval exists to find prose; the numbers are already queryable through the
+        tools, and far more accurately. Indexing every row buys nothing and costs an
+        embedding over the whole file.
+        """
+        preview = df.head(30).to_string()
+        more = f"\n... and {len(df) - 30:,} further rows" if len(df) > 30 else ""
+        columns = ", ".join(map(str, df.columns))
+        return (
+            f"Table {label}: {len(df):,} rows, {len(df.columns)} columns "
+            f"({columns}).\n\n{preview}{more}"
+        )
+
     def _semantic_chunking(
         self, text: str, source: str, doc_id: str, page_num: int = 1
     ) -> List[Dict]:
@@ -563,7 +749,20 @@ class IngestionService:
             return []
 
         chunks = []
-        paragraphs = re.split(r"\n\s*\n", text)
+
+        # Splitting on blank lines alone leaves anything without them intact, however
+        # long. A dataframe rendered to text has none, so a 6,000-row CSV arrived as a
+        # single 258,000-character chunk — one embedding over a quarter of a megabyte and
+        # a cross-encoder pass over the same, which took one retrieval from 30s to 8m22s.
+        paragraphs = []
+        for block in re.split(r"\n\s*\n", text):
+            if len(block) <= settings.CHUNK_SIZE:
+                paragraphs.append(block)
+                continue
+            step = max(1, settings.CHUNK_SIZE - settings.CHUNK_OVERLAP)
+            paragraphs.extend(
+                block[at : at + settings.CHUNK_SIZE] for at in range(0, len(block), step)
+            )
 
         current_chunk = ""
 
@@ -619,9 +818,42 @@ class IngestionService:
     # =========================================================================
 
     def _clean_name(self, name: str) -> str:
-        """Clean table/file names"""
-        name = name.split(".")[0]
-        return re.sub(r"[^a-zA-Z0-9_]", "_", name).strip("_")
+        """
+        Turn a filename or sheet name into an addressable table name.
+
+        Only a trailing extension is removed. Splitting on the first dot dropped
+        everything after it, so "book.xlsx_Sheet2" collapsed to "book" — every sheet in
+        a workbook produced the same key and all but the last were silently overwritten.
+
+        A name with no ASCII to keep falls back to a digest of the original: an
+        Arabic-titled file sanitised down to the empty string, leaving a table nothing
+        could refer to.
+        """
+        stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name)
+        cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", stem).strip("_")
+        if cleaned:
+            return cleaned
+        return f"table_{hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]}"
+
+    def _content_doc_id(self, filename: str, content, file_path) -> str:
+        """
+        An id derived from the file's contents, so re-uploading is recognisable.
+
+        Two uploads of the same bytes produce the same id and the second is skipped; an
+        edited file produces a different one and supersedes its predecessor. Falls back to
+        a random id only when there are no bytes to hash.
+        """
+        digest = hashlib.sha256()
+        if file_path:
+            with open(file_path, "rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+        elif content:
+            digest.update(content)
+        else:
+            return self._generate_doc_id(filename)
+
+        return f"{self._clean_name(filename)}_{digest.hexdigest()[:8]}"
 
     def _generate_doc_id(self, filename: str) -> str:
         """Generate unique document ID"""

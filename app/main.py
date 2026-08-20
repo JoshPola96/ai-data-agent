@@ -7,6 +7,7 @@ Version 5.0 - Optimized with enhanced debugging and chart support
 """
 
 import asyncio
+import contextvars
 import hashlib
 import re
 import logging
@@ -22,7 +23,9 @@ import os
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from app.utils.schemas import (
+    SESSION_ID_PATTERN,
     UploadResponse,
     ChatRequest,
     ChatResponse,
@@ -40,7 +43,7 @@ from app.services.tools import (
     execute_tool,
     build_table_context,
 )
-from app.utils.prompts import get_system_prompt
+from app.utils.prompts import anchor_language, get_system_prompt
 from app.core.dependencies import (
     vector_store,
     session_store,
@@ -57,6 +60,36 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Per-request log capture. A streamed answer that says only "turn 3 of 10" tells the reader
+# nothing: the interesting narration — which query was expanded, how many candidates the
+# reranker kept, what the chart service resolved — is already written to the log by the code
+# doing the work. A contextvar sink collects it per request, so concurrent requests never
+# see each other's lines, and the agent loop forwards it as it goes.
+#
+# Work handed to a thread pool (embedding, reranking) does not inherit the context, so those
+# lines still go only to the container log.
+_LOG_SINK: contextvars.ContextVar = contextvars.ContextVar("log_sink", default=None)
+
+
+class _SinkHandler(logging.Handler):
+    def emit(self, record):
+        sink = _LOG_SINK.get()
+        if sink is not None:
+            try:
+                sink.append(f"{record.name.split('.')[-1]}: {record.getMessage()}")
+            except Exception:
+                pass
+
+
+logging.getLogger("app").addHandler(_SinkHandler())
+
+
+def _drain(sink):
+    """Take everything logged since the last look, and clear it."""
+    lines, sink[:] = list(sink), []
+    return lines
+
 
 # ============================================================
 # LIFESPAN & INITIALIZATION
@@ -171,13 +204,10 @@ async def auto_ingest_kb_folder():
 
     logger.info(f"📚 Checking {len(files)} KB files...")
 
-    # The index is restored from disk before this runs, so re-ingesting blindly would
-    # duplicate the whole corpus on every restart. The content hash in doc_id makes an
-    # unchanged file a no-op and lets an edited one supersede its previous chunks.
+    # The index is restored from disk before this runs, so re-ingesting blindly would duplicate the whole corpus on every restart. The content hash in doc_id makes an unchanged file a no-op and lets an edited one supersede its previous chunks.
     indexed = {d.get("doc_id") for d in await vector_store.get_documents()}
 
-    # Vectors alone are not enough: the document registry is what tells the agent the
-    # file exists. If either half is missing the file is re-ingested to restore both.
+    # Vectors alone are not enough: the document registry is what tells the agent the file exists. If either half is missing the file is re-ingested to restore both.
     registered = {
         d.get("doc_id")
         for d in await session_store.get_session_documents(settings.KB_SESSION_ID)
@@ -228,8 +258,27 @@ async def _empty_list():
     return []
 
 
+def require_supported_model(name):
+    """
+    Reject an unknown model instead of letting it fail over silently.
+
+    /models/select validated while /chat did not, so a request naming a model that
+    does not exist answered anyway — the primary call failed, the fallback succeeded,
+    and the reply looked normal while coming from a model the caller never asked for.
+    """
+    if name and name not in settings.SUPPORTED_MODELS:
+        raise HTTPException(
+            400,
+            f"Unsupported model '{name}'. Available: {settings.SUPPORTED_MODELS}",
+        )
+    return name
+
+
 # Tools whose output is rendered rather than reasoned over
 VISUAL_TOOLS = {"generate_chart", "generate_dashboard", "generate_diagram"}
+
+# The only block types the model may compose itself. Charts and diagrams come from tools, never from the model's own JSON, and the frontend draws nothing for any other type.
+COMPOSABLE_VISUALS = {"table", "text"}
 
 
 def capture_visuals(raw: str, sink: List[Dict]) -> str:
@@ -280,16 +329,44 @@ def capture_visuals(raw: str, sink: List[Dict]) -> str:
             or f"Chart {len(sink) + 1}"
         )
 
-        sink.append(
-            {
-                "type": "chart",
-                "chart_data": {
-                    "chart_json": chart.get("chart_json"),
-                    "summary": chart.get("summary"),
-                },
-                "caption": title,
-            }
+        # A dashboard panel and a separately requested chart of the same thing are the
+        # same figure twice. Asked for a six-part review, the model called
+        # generate_dashboard and then generate_chart for three of its panels, and the
+        # reader scrolled past the same bar chart three times.
+        # Title included: the same figure under a different heading is being presented as
+        # a different thing, and only an exact repeat is worth suppressing.
+        digest = hashlib.sha1(
+            json.dumps([title, chart.get("chart_json")], sort_keys=True, default=str).encode()
+        ).hexdigest()
+        if any(v.get("digest") == digest for v in sink):
+            logger.info(f"  ⧗ Skipped duplicate figure '{title}'")
+            continue
+
+        entry = {
+            "type": "chart",
+            "chart_data": {
+                "chart_json": chart.get("chart_json"),
+                "summary": chart.get("summary"),
+            },
+            "caption": title,
+            "digest": digest,
+        }
+
+        # Same heading, different bars: the model redrew the figure, and the redraw is the
+        # one it goes on to describe. Asked for revenue by region it charted eight bars,
+        # noticed the spellings warning, charted four — and shipped both, the wrong
+        # figure sitting directly above the right one under an identical title. Keeping
+        # the later attempt is what the prose agrees with.
+        prior = next(
+            (i for i, v in enumerate(sink)
+             if v.get("type") == "chart" and v.get("caption") == title),
+            None,
         )
+        if prior is not None:
+            logger.info(f"  ♻ Replaced an earlier '{title}' with the redrawn figure")
+            sink[prior] = entry
+        else:
+            sink.append(entry)
         receipts.append({"title": title, "summary": chart.get("summary")})
 
     logger.info(f"  🎨 Captured {len(receipts)} chart(s) out-of-band")
@@ -358,6 +435,14 @@ def extract_tool_info(tc: Any) -> tuple[str, Dict]:
     return "unknown_tool", {}
 
 
+def _decode_json_string(body: str) -> str:
+    """Unescape a JSON string body recovered by regex rather than by the parser."""
+    try:
+        return json.loads(f'"{body}"')
+    except json.JSONDecodeError:
+        return body.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+
+
 def extract_structured_response(content: str) -> tuple[str, Dict]:
     """
     Robust JSON extractor with comprehensive fallback handling.
@@ -372,7 +457,11 @@ def extract_structured_response(content: str) -> tuple[str, Dict]:
             {
                 "visualizations": data.get("visualizations", []),
                 "key_insights": data.get("key_insights", []),
+                "assumptions": data.get("assumptions", []),
                 "sources_from_response": data.get("sources_used", []),
+                # Carried through so a drift is visible in the trace rather than only in
+                # the prose, where the reader has to notice it themselves.
+                "question_language": data.get("question_language", ""),
             },
         )
 
@@ -426,17 +515,32 @@ def extract_structured_response(content: str) -> tuple[str, Dict]:
     # Strategy 3: Emergency fallback - construct minimal valid response
     logger.warning("⚠️ All JSON parsing failed - constructing emergency response")
 
-    # Try to extract at least the answer field
-    answer_match = re.search(r'"answer"\s*:\s*"([^"]+)"', content, re.DOTALL)
+    # The fragment is still a JSON string literal, escapes and all. Taking it raw put a
+    # literal backslash-n through to the chat and cut the answer at the first quoted
+    # word; decoding it as the string it is restores both.
+    answer_match = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL)
     if answer_match:
-        answer_text = answer_match.group(1)
+        answer_text = _decode_json_string(answer_match.group(1))
         logger.info(f"  Salvaged answer field: {answer_text[:100]}...")
     else:
         # Use raw content as answer
         answer_text = content[:1000] + ("..." if len(content) > 1000 else "")
         logger.warning("  Using raw content as answer")
 
-    return answer_text, {}
+    # Same shape as the parsed paths. Every caller reads these with .get today, so an
+    # empty dict does no harm now — it just leaves the next one a KeyError to find.
+    #
+    # `salvaged` is carried so the reader is told. Asked for a hundred rows as a table the
+    # model emitted JSON longer than the token limit; it was cut mid-structure, salvage
+    # recovered the prose, and the table it referred to was silently gone — leaving an
+    # answer that said "here are the first 100 sales figures" above nothing at all.
+    return answer_text, {
+        "visualizations": [],
+        "salvaged": True,
+        "key_insights": [],
+        "assumptions": [],
+        "sources_from_response": [],
+    }
 
 
 # ============================================================
@@ -445,7 +549,11 @@ def extract_structured_response(content: str) -> tuple[str, Dict]:
 
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
+async def upload(
+    file: UploadFile = File(...),
+    session_id: str = Form(..., pattern=SESSION_ID_PATTERN,
+                           max_length=settings.MAX_SESSION_ID_CHARS),
+):
     """
     Upload document with stream processing to prevent OOM.
     Supports: PDF, DOCX, XLSX, CSV, TXT
@@ -492,7 +600,8 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
         logger.info("=" * 80)
 
         return UploadResponse(
-            status="success",
+            # "unchanged" when the same bytes are already here, so the UI can say so
+            status=result.get("status", "success"),
             session_id=session_id,
             filename=result["filename"],
             doc_id=result["doc_id"],
@@ -500,6 +609,12 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
             dataframes=result["dataframes"],
         )
 
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # A file we cannot read is the caller's problem to fix, not a server fault
+        logger.error(f"❌ Upload rejected: {e}")
+        raise HTTPException(400, str(e))
     except Exception as e:
         logger.error(f"❌ Upload failed: {str(e)}", exc_info=True)
         raise HTTPException(500, str(e))
@@ -511,13 +626,20 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
             logger.debug(f"  🗑️  Cleaned temp file: {tmp_path}")
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def run_agent(req: ChatRequest):
     """
-    Main chat endpoint with parallel agentic reasoning loop.
-    Supports concurrent tool execution, RAG, and structured JSON outputs.
+    The agent loop, as a stream of events ending in one `final` carrying the response.
+    
+    Written as a generator so /chat and /chat/stream are the same reasoning: one collects
+    the events and returns the answer, the other forwards them as they happen. A ten-turn
+    question can run for a minute, and a spinner that says nothing for a minute is
+    indistinguishable from a hang.
     """
     sid = req.session_id or str(uuid.uuid4())
+    require_supported_model(req.model)
+
+    sink = []
+    _LOG_SINK.set(sink)
 
     logger.info("=" * 80)
     logger.info("💬 CHAT REQUEST (PARALLEL)")
@@ -530,9 +652,7 @@ async def chat(req: ChatRequest):
     try:
         start_time = asyncio.get_event_loop().time()
 
-        # Load context concurrently. The shared knowledge base is retrievable by every
-        # session, so it must appear here too — otherwise the prompt reports no files
-        # and the agent denies having any documents it can actually search.
+        # Load context concurrently. The shared knowledge base is retrievable by every session, so it must appear here too — otherwise the prompt reports no files and the agent denies having any documents it can actually search.
         kb = settings.KB_SESSION_ID
         dfs, hist, docs, kb_dfs, kb_docs = await asyncio.gather(
             session_store.get_all_dataframes(sid),
@@ -545,6 +665,8 @@ async def chat(req: ChatRequest):
         # Session data shadows the knowledge base on a name clash
         dfs = {**kb_dfs, **dfs}
         docs = docs + kb_docs
+
+        yield {"type": "context", "tables": sorted(dfs), "documents": len(docs)}
 
         logger.info("📊 Context loaded:")
         logger.info(f"  DataFrames: {len(dfs)}")
@@ -565,7 +687,7 @@ async def chat(req: ChatRequest):
         df_ctx = build_table_context(dfs)
 
         # Tools
-        tools = get_tool_definitions(dfs)
+        tools = get_tool_definitions(dfs, req.query)
         logger.info(f"🔧 Tools available: {len(tools)}")
 
         # Conversation summary
@@ -574,10 +696,12 @@ async def chat(req: ChatRequest):
         )
 
         # Initialize messages
-        msgs = hist + [{"role": "user", "content": req.query}]
+        msgs = hist + [{"role": "user", "content": anchor_language(req.query)}]
 
         # Agent loop state
         turn = 0
+        answering_model = req.model or llm_service.model
+        degraded = announced = None
         final_text = ""
         final_meta = {}
         ctx = ""
@@ -590,12 +714,17 @@ async def chat(req: ChatRequest):
             turn += 1
             logger.info(f"🔄 Turn {turn}/{settings.AGENT_MAX_TURNS}")
 
-            # Withholding tools on the final turn forces a synthesis from what was
-            # already gathered. Otherwise the loop can spend its whole budget calling
-            # tools and return an apology instead of an answer.
+            # Withholding tools on the final turn forces a synthesis from what was already gathered. Otherwise the loop can spend its whole budget calling tools and return an apology instead of an answer.
             final_turn = turn == settings.AGENT_MAX_TURNS
             if final_turn:
                 logger.info("  ⏹ Final turn: answering without tools")
+
+            yield {
+                "type": "turn",
+                "turn": turn,
+                "of": settings.AGENT_MAX_TURNS,
+                "tools_offered": not final_turn,
+            }
 
             # Build system prompt
             sys_prompt = get_system_prompt(
@@ -605,6 +734,14 @@ async def chat(req: ChatRequest):
                 conv_summary,
                 req.query,
             )
+
+            yield {
+                "type": "llm_call",
+                "model": req.model or llm_service.model,
+                "messages": len(msgs),
+                "tools": 0 if final_turn else len(tools),
+            }
+            yield {"type": "log", "lines": _drain(sink)}
 
             # Call LLM
             logger.info("  🤖 Calling LLM...")
@@ -619,12 +756,33 @@ async def chat(req: ChatRequest):
 
             content = llm_resp.get("content", "")
             tool_calls = llm_resp.get("tool_calls", [])
+            answering_model = llm_resp.get("model") or answering_model
+            # A silent failover once presented a Gemini answer as gpt-4o's. If the model that answered is not the one asked for, the reader is told why.
+            if llm_resp.get("degraded"):
+                degraded = llm_resp["degraded"]
 
             logger.info(f"  📝 Response: {len(content)} chars")
             logger.info(f"  🔧 Tool calls: {len(tool_calls)}")
 
+            yield {"type": "log", "lines": _drain(sink)}
+
             if content:
                 logger.info(f"  💭 Reasoning preview: {content[:500]}...")
+                # Reasoning alongside a tool call is the agent thinking aloud; on the last
+                # turn the content is the answer being drafted. Gemini in JSON mode often
+                # returns neither, which is why the log stream carries the detail.
+                yield {
+                    "type": "thinking",
+                    "text": content[:600],
+                    "drafting": not tool_calls,
+                }
+
+            # Once per request, not once per turn: `degraded` stays set for the rest of the
+            # loop, so a failover on turn one stacked an identical warning on every turn
+            # after it.
+            if degraded and degraded != announced:
+                announced = degraded
+                yield {"type": "notice", "text": degraded}
 
             # Capture reasoning
             if content and (tool_calls or turn < settings.AGENT_MAX_TURNS):
@@ -661,6 +819,7 @@ async def chat(req: ChatRequest):
                             type="tool_call", tool_name=tool_name, tool_args=tool_args
                         )
                     )
+                    yield {"type": "tool_call", "name": tool_name, "args": tool_args}
 
                     # Branch execution: Search vs standard tools
                     if tool_name == "search_knowledge_base":
@@ -724,6 +883,14 @@ async def chat(req: ChatRequest):
                             "content": formatted_result,
                         }
                     )
+                    yield {
+                        "type": "tool_result",
+                        "name": info["name"],
+                        "summary": " ".join(formatted_result.split())[:220],
+                        "failed": formatted_result.startswith("Error:"),
+                    }
+
+                yield {"type": "log", "lines": _drain(sink)}
 
                 logger.info("  ✅ Batch execution complete")
                 continue  # Go to next turn to let LLM analyze the parallel results
@@ -741,16 +908,15 @@ async def chat(req: ChatRequest):
 
         logger.info(f"🏁 Agent loop completed: {turn} turns")
 
-        # Visuals actually produced by tools win over anything the model echoed back;
-        # tables and prose blocks it composed are kept alongside them
+        # Visuals the tools produced win over anything the model echoed back, and only# blocks the frontend can draw survive. A model that describes a chart in `visualizations` instead of calling the tool emits a spec, not a figure, and the renderer draws an empty panel for it — silently, which is how it went unnoticed.
+        echoed = final_meta.get("visualizations") or []
+        composed = [v for v in echoed if v.get("type") in COMPOSABLE_VISUALS]
+        if len(composed) != len(echoed):
+            logger.warning(
+                f"⚠️ Dropped {len(echoed) - len(composed)} unrenderable visual(s) from the model"
+            )
+        final_meta["visualizations"] = produced_visuals + composed
         if produced_visuals:
-            rendered = {"chart", "diagram"}
-            composed = [
-                v
-                for v in final_meta.get("visualizations", [])
-                if v.get("type") not in rendered
-            ]
-            final_meta["visualizations"] = produced_visuals + composed
             logger.info(f"🎨 Attached {len(produced_visuals)} visual(s) to response")
 
         # Save to history
@@ -761,24 +927,89 @@ async def chat(req: ChatRequest):
         meta = {
             "processing_time": round(processing_time, 2),
             "turns_taken": turn,
-            "model_used": req.model or llm_service.model,
+            # The model that produced the answer, which is not the requested one when a provider 429s and the call fails over.
+            "model_used": answering_model,
+            "degraded": degraded,
             **final_meta,
         }
+
+        # A salvaged answer is a truncated one: whatever it promised beyond the prose —
+        # a table, a figure, its insights — did not survive. Saying so is the difference
+        # between a short answer and a wrong one.
+        if final_meta.get("salvaged"):
+            logger.warning("⚠️ Answer salvaged from malformed JSON; structured fields lost")
+            meta["degraded"] = (
+                (degraded + " ") if degraded else ""
+            ) + ("The reply was cut short and had to be recovered from partial output, so "
+                 "its insights and sources are missing and anything it promised beyond the "
+                 "prose may be too. Charts already drawn are still shown. Ask for fewer rows.")
+
+        # Logged because an answer that drifted into another language is obvious to the
+        # reader and invisible in the trace, and the declaration is the only place the
+        # model states what it thought the question was written in.
+        if meta.get("question_language"):
+            logger.info(f"🗣 Answered as: {meta['question_language']}")
 
         logger.info(f"⏱️ Total time: {processing_time:.2f}s")
         logger.info("=" * 80)
 
-        return ChatResponse(
-            session_id=sid,
-            response=final_text or "No response generated.",
-            sources=list(set(srcs)),
-            metadata=meta,
-            agent_trace=agent_trace,
-        )
+        yield {"type": "log", "lines": _drain(sink)}
+        yield {
+            "type": "final",
+            "response": ChatResponse(
+                session_id=sid,
+                response=final_text or "No response generated.",
+                sources=list(set(srcs)),
+                metadata=meta,
+                agent_trace=agent_trace,
+            ),
+        }
 
     except Exception as e:
         logger.error(f"❌ Chat error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """
+    Main chat endpoint with parallel agentic reasoning loop.
+    Supports concurrent tool execution, RAG, and structured JSON outputs.
+    """
+    require_supported_model(req.model)
+
+    async for event in run_agent(req):
+        if event["type"] == "final":
+            return event["response"]
+
+    raise HTTPException(500, "The agent loop produced no answer")
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    The same reasoning, narrated as newline-delimited JSON while it happens.
+
+    Each line is one event: `context`, `turn`, `thinking`, `tool_call`, `tool_result`,
+    `notice`, and finally `final` carrying the identical payload /chat returns. Errors
+    arrive as an `error` event rather than a torn response, because the status line has
+    already been sent by the time anything can fail.
+    """
+    require_supported_model(req.model)
+
+    async def events():
+        try:
+            async for event in run_agent(req):
+                if event["type"] == "final":
+                    event = {"type": "final", "response": event["response"].model_dump()}
+                yield json.dumps(event, default=str) + "\n"
+        except HTTPException as e:
+            yield json.dumps({"type": "error", "detail": e.detail}) + "\n"
+        except Exception as e:
+            logger.error(f"❌ Streamed chat error: {e}", exc_info=True)
+            yield json.dumps({"type": "error", "detail": str(e)}) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.get("/sessions/{sid}/history", response_model=HistoryResponse)
@@ -911,10 +1142,7 @@ async def list_models():
 @app.post("/models/select")
 async def select_model(model_name: str = Query(...)):
     """Select AI model"""
-    if model_name not in settings.SUPPORTED_MODELS:
-        raise HTTPException(
-            400, f"Invalid model. Valid options: {settings.SUPPORTED_MODELS}"
-        )
+    require_supported_model(model_name)
 
     llm_service.model = model_name
     logger.info(f"🤖 Model switched to: {model_name}")

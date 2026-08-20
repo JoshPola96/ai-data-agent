@@ -34,8 +34,7 @@ class HybridRetriever:
         self.reranker: CrossEncoder = None
         self._reranker_initialized = False
         self._lock = Lock()
-        # BM25 tokenises the whole corpus to build, so it is cached against the
-        # store's version rather than rebuilt for every request
+        # BM25 tokenises the whole corpus to build, so it is cached against the store's version rather than rebuilt for every request
         self._bm25 = None
         self._bm25_version = None
         self._bm25_lock = Lock()
@@ -110,8 +109,7 @@ class HybridRetriever:
             logger.warning("⚠️ No documents in vector store")
             return []
 
-        # Scope to the documents this session may see; positions stay global so BM25
-        # and the vector index agree and the cached index is shared by every session
+        # Scope to the documents this session may see; positions stay global so BM25 and the vector index agree and the cached index is shared by every session
         allowed = (
             None
             if session_ids is None

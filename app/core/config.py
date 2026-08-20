@@ -7,7 +7,7 @@ Centralized settings with environment variable support
 
 import torch
 from functools import cached_property, lru_cache
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -70,32 +70,59 @@ class Settings(BaseSettings):
     # Wildcard origins are invalid with credentials enabled; list the frontend explicitly
     CORS_ORIGINS: list = ["http://localhost:8501", "http://127.0.0.1:8501"]
     LOG_LEVEL: str = "INFO"
-    DEBUG_MODE: bool = True  # Enable comprehensive debug logging
+    # Debug logging includes document content and tool arguments; off by default
+    DEBUG_MODE: bool = False
 
     # =========================
     # LLM Configuration
     # =========================
-    # Model format: "provider:model" or just "model" (defaults to OpenAI)
-    # Gemini options: gemini-2.0-flash-001 (stable, GA), gemini-2.5-flash-001 (latest), gemini-2.0-pro-exp (best)
-    # OpenAI options: gpt-4o (best), gpt-3.5-turbo (cheap)
-    DEFAULT_MODEL: str = "gpt-4o"
-    FALLBACK_MODEL: str = "gemini:gemini-flash-latest"
-    LLM_TEMPERATURE: float = 0.1
-    LLM_MAX_TOKENS: int = 4000
+    # "provider:model" routes explicitly; a bare name goes to OpenAI. Both must appear
+    # in SUPPORTED_MODELS — /chat and /models/select reject anything else.
+    DEFAULT_MODEL: str = "gemini:gemini-3.6-flash"
+    # Deliberately the other provider: a fallback sharing the primary's key and quota dies
+    # with it. A Gemini day-quota wall took out both halves of a Gemini-to-Gemini pair.
+    FALLBACK_MODEL: str = "gpt-5-mini"
+    # Zero, because the same question asked twice should give the same answer. At 0.1 it
+    # did not: one run took "typical order size" as the median value and the next as the
+    # median unit count, one run summed two files' totals and the next correctly refused,
+    # one applied a subset filter and the next reported the unfiltered figure. Every
+    # number was right in both — the variance was in interpretation and rule-following,
+    # which is exactly what sampling noise costs an agent that must obey a dozen rules
+    # per turn. Raise it only if you want variety over repeatability.
+    LLM_TEMPERATURE: float = 0.0
+    LLM_MAX_TOKENS: int = 8192
     AGENT_MAX_TURNS: int = 10
 
-    # Single source of truth for /models and /models/select; "gemini:" prefix routes to Google
+    # The allow-list /models serves and both endpoints validate against, so a typo is
+    # rejected rather than answered by the fallback. Routing is by prefix, not by this
+    # list: "gemini:" goes to Google and anything else to OpenAI, so adding a name here
+    # is all it takes to select any model either provider offers.
+    #
+    # Reasoning-grade models first — this agent plans over ten turns, picks its own tools
+    # and writes structured output, which is where the cheaper models thin out.
+    # Every Gemini name here was confirmed by an actual generate call, not by appearing in
+    # the model list: gemini-2.5-pro is still listed and answers a 404 saying it is no
+    # longer available to new keys.
     SUPPORTED_MODELS: list = [
-        "gemini:gemini-2.5-flash",
-        "gemini:gemini-flash-latest",
-        "gemini:gemini-3-flash-preview",
+        # Reasoning-grade — what a ten-turn agentic workload deserves
+        "gemini:gemini-3.1-pro-preview",
+        "gemini:gemini-pro-latest",
         "gpt-5.2",
+        "gpt-5-pro",
+        # Current generation, fast and cheap enough to leave running
+        "gemini:gemini-3.6-flash",
+        "gemini:gemini-3.5-flash",
+        "gemini:gemini-flash-latest",
         "gpt-5-mini",
+        # Cheapest, and the previous generation kept for comparison
+        "gemini:gemini-3.5-flash-lite",
+        "gemini:gemini-2.5-flash",
         "gpt-4o",
     ]
 
-    # Transient faults (429 rate limit, 503 overload) are retried before failing over.
-    # Kept low on purpose: a funding error is never retried, and each attempt costs.
+    # Retried on HTTP status alone (429, 503, timeouts) before failing over. Kept low
+    # because each attempt adds latency; an exhausted account is refused before any
+    # completion is generated, so retrying it costs time rather than money.
     LLM_MAX_RETRIES: int = 2
     LLM_RETRY_BASE_DELAY: float = 1.0
 
@@ -191,7 +218,10 @@ class Settings(BaseSettings):
     # Data Processing
     # =========================
     # Universal data type handling
-    FORCE_STRING_COLUMNS: list = ["id", "code", "reference", "employee_code"]
+    # Name tokens that mark a column as an identifier rather than a measure. Matched as
+    # whole `_`-separated parts, so "id" catches customer_id while leaving notes alone.
+    # Zero-padded values are detected independently, so this list need not be exhaustive.
+    FORCE_STRING_COLUMNS: list = ["id", "code", "ref", "reference", "sku", "employee_code"]
     NUMERIC_CONVERSION_THRESHOLD: float = 0.7  # 70% valid numbers to convert column
     DATE_FORMATS: list = [
         "%Y-%m-%d",
@@ -206,9 +236,12 @@ class Settings(BaseSettings):
         "%B %Y",  # Nov-19, November 2019
     ]
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # One .env serves both this class and Docker Compose interpolation, so it
+    # legitimately carries keys the application does not own — GPU_COUNT is read by
+    # compose to decide whether to request a device. Ignore rather than reject.
+    model_config = SettingsConfigDict(
+        env_file=".env", case_sensitive=True, extra="ignore"
+    )
 
 
 @lru_cache()

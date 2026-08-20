@@ -64,7 +64,11 @@ class FallbackTest(unittest.IsolatedAsyncioTestCase):
             )
 
         chat.assert_not_called()
-        self.assertIn("unavailable", result["content"])
+        # The dead end names the model and the reason: a silent "temporarily unavailable"
+        # hid an exhausted key behind a message that suggested waiting would help.
+        self.assertIn("gemini:gemini-flash-latest", result["content"])
+        self.assertIn("no usable fallback", result["content"])
+        self.assertIn("no fallback available", result["degraded"])
 
     async def test_fallback_hops_once_when_a_different_model_failed(self):
         svc = LLMService()
@@ -83,3 +87,44 @@ class FallbackTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemperatureHasOneSourceOfTruth(unittest.TestCase):
+    """
+    The same twelve questions run twice diverged on five of them — a subset filter applied
+    once and skipped once, two files' totals summed once and correctly refused once. Every
+    figure was right in both runs; what varied was interpretation. An agent obeying a dozen
+    rules a turn cannot afford sampling noise, so the default is zero and lives in exactly
+    one place.
+    """
+
+    def test_the_shipped_default_is_deterministic(self):
+        """The class default, not the resolved value — a local .env may override it."""
+        from app.core.config import Settings
+
+        self.assertEqual(Settings.model_fields["LLM_TEMPERATURE"].default, 0.0)
+
+    def test_the_chat_default_comes_from_settings_not_a_literal(self):
+        import inspect
+
+        from app.core.config import get_settings
+        from app.services.llm import LLMService
+
+        default = inspect.signature(LLMService.chat).parameters["temperature"].default
+        self.assertEqual(default, get_settings().LLM_TEMPERATURE)
+
+    def test_query_expansion_keeps_its_own_named_temperature(self):
+        """Variety is the point there, so it differs on purpose and says so."""
+        from app.services.llm import _EXPANSION_TEMPERATURE
+
+        self.assertGreater(_EXPANSION_TEMPERATURE, 0.0)
+
+    def test_no_bare_temperature_literal_survives_in_the_service(self):
+        import inspect
+        import re
+
+        import app.services.llm as mod
+
+        source = inspect.getsource(mod)
+        literals = re.findall(r"temperature\s*=\s*(0\.\d+|[1-9])", source)
+        self.assertEqual(literals, [], f"hardcoded temperature(s): {literals}")

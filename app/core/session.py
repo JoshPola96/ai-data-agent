@@ -300,8 +300,9 @@ class SessionStore:
         # 4. Remove from Vector Store (Physical)
         if vector_store and filename:
             try:
-                # We assume Source field in vector store = filename
-                count = await vector_store.remove_by_source(filename)
+                # Scoped to this session: the same filename in another session is
+                # another user's document, and deleting it here would take theirs too.
+                count = await vector_store.remove_by_source(filename, session_id)
                 logger.info(f"✅ Removed {count} vectors for {filename}")
             except Exception as e:
                 logger.error(f"❌ Vector deletion failed: {e}")

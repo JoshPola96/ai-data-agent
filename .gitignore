@@ -43,9 +43,9 @@ secrets.toml
 *.pem
 
 # Knowledge base holds user-supplied documents; keep the folder, never the contents
+# Documents are the user's own; the folder ships empty
 app/kb/*
 !app/kb/.gitkeep
-!app/kb/README.md
 
 # Logs
 *.log
@@ -65,7 +65,16 @@ htmlcov/
 # Redis
 dump.rdb
 
+# The FAISS index and its sidecar. A named Docker volume holds these normally, but a
+# bare-metal run writes them under the repository.
+data/
+app/data/
+*.faiss
+
 # Temporary files
 *.tmp
 temp/
 tmp/
+
+# Local compose overrides (host-specific port conflicts, dev flags)
+docker-compose.override.yml

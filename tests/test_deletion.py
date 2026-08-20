@@ -106,13 +106,17 @@ class DeleteDocumentTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.store.get_session_documents(self.session), [])
 
-    async def test_vectors_are_removed_by_source(self):
+    async def test_vectors_are_removed_by_source_within_this_session(self):
+        """
+        Filename alone is not an identity. Two people uploading report.pdf own different
+        documents, and an unscoped delete took both.
+        """
         vs = MagicMock()
         vs.remove_by_source = AsyncMock(return_value=3)
 
         await self.store.delete_document(self.session, "doc1", vector_store=vs)
 
-        vs.remove_by_source.assert_awaited_once_with("payslips.xlsx")
+        vs.remove_by_source.assert_awaited_once_with("payslips.xlsx", self.session)
 
     async def test_deleting_an_unknown_document_is_reported(self):
         self.assertFalse(await self.store.delete_document(self.session, "ghost"))

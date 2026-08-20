@@ -23,6 +23,7 @@ openpyxl
 xlrd
 tabulate
 streamlit
+requests
 plotly
 matplotlib
 google-genai

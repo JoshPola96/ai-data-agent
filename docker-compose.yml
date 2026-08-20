@@ -27,21 +27,28 @@ services:
       - .env
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - KB_PATH=/app/kb
       # - HF_HUB_OFFLINE=1 # Uncomment to force offline mode for Hugging Face
     volumes:
       - ./app:/app/app
       - ./app/kb:/app/kb
+      # The README tells the reader to run the suite inside this container, so the tests
+      # have to be reachable there. Mounted rather than baked: they are not part of the
+      # runtime, and copying them would rebuild the image for every test edit.
+      - ./tests:/app/tests
       - index_data:/app/data
     depends_on:
       redis:
         condition: service_healthy
+    # Docker cannot detect a GPU for you: a device has to be requested explicitly, and
+    # requesting one that does not exist fails the container. Requesting zero is a
+    # no-op, so the default starts anywhere and GPU hosts set GPU_COUNT=1 in .env.
+    # The application then auto-detects whatever is exposed and picks CUDA or CPU.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: ${GPU_COUNT:-0}
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]

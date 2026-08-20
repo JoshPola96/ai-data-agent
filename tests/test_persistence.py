@@ -150,3 +150,66 @@ async def _noop():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemovalReusesVectorsTest(PersistenceTest):
+    """
+    Deleting a document must not re-embed the corpus.
+
+    Removing one file used to call _build_index, which encodes every surviving chunk:
+    88 texts took 46.7s on CPU, so the UI's 10s timeout reported a failure while the
+    delete was still running. A flat index can hand its vectors back.
+    """
+
+    def tracked(self, n=6):
+        store = self.populated(n=n)
+        store.embedder = None  # any encode attempt now raises rather than silently working
+        return store
+
+    async def test_removing_a_source_keeps_the_other_vectors(self):
+        store = self.tracked()
+        store.documents[0]["source"] = "gone.pdf"
+        store.documents[1]["source"] = "gone.pdf"
+
+        removed = await store.remove_by_source("gone.pdf")
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(store.index.ntotal, 4)
+        self.assertEqual(len(store.documents), 4)
+
+    async def test_removing_a_session_keeps_the_other_vectors(self):
+        store = self.tracked()
+        for doc in store.documents[:2]:
+            doc["session_id"] = "bob"
+
+        removed = await store.remove_by_session("bob")
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(store.index.ntotal, 4)
+
+    async def test_pruning_expired_sessions_keeps_the_survivors(self):
+        store = self.tracked()
+        for doc in store.documents[:3]:
+            doc["session_id"] = "expired"
+
+        removed = await store.prune_sessions(lambda sid: sid != "expired")
+
+        self.assertEqual(removed, 3)
+        self.assertEqual(store.index.ntotal, 3)
+
+    async def test_the_surviving_vectors_are_the_right_ones(self):
+        """A row filter that keeps the wrong rows would misattribute every later hit."""
+        store = self.tracked(n=4)
+        before = store.index.reconstruct_n(0, 4)
+        store.documents[1]["source"] = "gone.pdf"
+
+        await store.remove_by_source("gone.pdf")
+
+        kept = store.index.reconstruct_n(0, 3)
+        np.testing.assert_allclose(kept, before[[0, 2, 3]], atol=1e-6)
+
+    async def test_removing_everything_leaves_an_empty_index(self):
+        store = self.tracked(n=3)
+        removed = await store.remove_by_source("a.pdf")
+        self.assertEqual(removed, 3)
+        self.assertEqual(store.index.ntotal, 0)

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
 from app.core.config import get_settings
 from app.core.gpu import infer
@@ -32,6 +33,11 @@ class VectorStore:
         self.index: Optional[faiss.Index] = None
         self.embedder: Optional[SentenceTransformer] = None
         self.dim = settings.EMBEDDING_DIM
+        # Per-instance rather than read from settings at each write, so a store built for
+        # a test cannot persist over the real index. It could: the offline suite wrote an
+        # 8-dimensional index to the configured path, the next start found the dimensions
+        # disagreed and discarded it, and the knowledge base came up empty.
+        self.persist = settings.PERSIST_INDEX
         # Bumped on every mutation so derived indexes know when they are stale
         self.version = 0
         self._lock = asyncio.Lock()
@@ -101,7 +107,7 @@ class VectorStore:
 
     def _restore(self):
         """Load a previously persisted index so uploads survive a restart."""
-        if not settings.PERSIST_INDEX:
+        if not self.persist:
             return
 
         index_path, docs_path = self._paths()
@@ -132,7 +138,7 @@ class VectorStore:
 
     def _persist(self):
         """Write index and documents atomically so a crash cannot leave a torn pair."""
-        if not settings.PERSIST_INDEX or self.index is None:
+        if not self.persist or self.index is None:
             return
 
         index_path, docs_path = self._paths()
@@ -153,15 +159,39 @@ class VectorStore:
         except Exception as e:
             logger.error(f"❌ Index persistence failed: {e}")
 
+    async def _keep_rows(self, mask: List[bool]) -> None:
+        """
+        Rebuild the index from the rows that survive, reusing their vectors.
+
+        Removing one document used to re-encode every remaining chunk — 88 texts took
+        46.7s on CPU, long enough that the UI's 10s timeout reported a failure while the
+        delete was still succeeding. A flat index hands its vectors back on request, so a
+        removal is a row filter rather than an embedding job. Falls back to a full rebuild
+        if the index and the mask ever disagree on length.
+        """
+        if self.index is None or self.index.ntotal != len(mask):
+            logger.warning("⚠️ Index and document list out of step, re-encoding")
+            await self._build_index()
+            return
+
+        kept = self.index.reconstruct_n(0, self.index.ntotal)[
+            np.asarray(mask, dtype=bool)
+        ]
+        self.index = faiss.IndexFlatIP(self.dim)
+        if len(kept):
+            self.index.add(kept)
+        logger.info(f"✂️ Kept {self.index.ntotal} vectors, no re-encoding")
+
     async def prune_sessions(self, keep) -> int:
         """Drop documents whose session no longer exists; keep(session_id) decides."""
         async with self._lock:
             before = len(self.documents)
-            self.documents = [d for d in self.documents if keep(d.get("session_id"))]
+            survives = [bool(keep(d.get("session_id"))) for d in self.documents]
+            self.documents = [d for d, s in zip(self.documents, survives) if s]
             removed = before - len(self.documents)
 
             if removed:
-                await self._build_index()
+                await self._keep_rows(survives)
                 self._persist()
                 logger.info(f"🧹 Pruned {removed} documents from expired sessions")
                 self.version += 1
@@ -374,6 +404,16 @@ class VectorStore:
 
         return results
 
+    async def count_by_source(self, source: str, session_id: str = None) -> int:
+        """How many chunks of a named document are indexed, within a session if given."""
+        async with self._lock:
+            return sum(
+                1
+                for d in self.documents
+                if d.get("source") == source
+                and (session_id is None or d.get("session_id") == session_id)
+            )
+
     async def get_documents(
         self, indices: Optional[List[int]] = None
     ) -> List[Dict[str, str]]:
@@ -396,13 +436,12 @@ class VectorStore:
         """Remove every document owned by a session and reindex."""
         async with self._lock:
             initial_count = len(self.documents)
-            self.documents = [
-                d for d in self.documents if d.get("session_id") != session_id
-            ]
+            survives = [d.get("session_id") != session_id for d in self.documents]
+            self.documents = [d for d, s in zip(self.documents, survives) if s]
             removed_count = initial_count - len(self.documents)
 
             if removed_count > 0:
-                await self._build_index()
+                await self._keep_rows(survives)
                 self._persist()
                 logger.info(
                     f"🗑️ Removed {removed_count} documents for session {session_id[:8]}"
@@ -411,15 +450,28 @@ class VectorStore:
 
         return removed_count
 
-    async def remove_by_source(self, source: str) -> int:
-        """Remove all documents from a specific source."""
+    async def remove_by_source(self, source: str, session_id: str = None) -> int:
+        """
+        Remove the chunks of one source, optionally only within one session.
+
+        Filename alone is not an identity: two people uploading report.pdf own different
+        documents, and deleting unscoped took both. The knowledge-base refresh still calls
+        this without a session, because there the filename genuinely is the identity.
+        """
         async with self._lock:
             initial_count = len(self.documents)
-            self.documents = [d for d in self.documents if d.get("source") != source]
+            survives = [
+                not (
+                    d.get("source") == source
+                    and (session_id is None or d.get("session_id") == session_id)
+                )
+                for d in self.documents
+            ]
+            self.documents = [d for d, s in zip(self.documents, survives) if s]
             removed_count = initial_count - len(self.documents)
 
             if removed_count > 0:
-                await self._build_index()
+                await self._keep_rows(survives)
                 self._persist()
                 logger.info(
                     f"🗑️ Removed {removed_count} documents from source: {source}"
