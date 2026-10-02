@@ -78,3 +78,4 @@ tmp/
 
 # Local compose overrides (host-specific port conflicts, dev flags)
 docker-compose.override.yml
+.ipynb_checkpoints/
